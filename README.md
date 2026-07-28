@@ -1,6 +1,111 @@
-# Sistema de Emisión 24/7-Astra
+# Sistema de Emisión 24/7 - Astra
 
-Dashboard web para gestión y monitoreo de streams FFmpeg en tiempo real. Control total de múltiples transmisiones simultáneas con monitoreo automático, detección de freeze por inactividad de frames, reinicio a medianoche, métricas de sistema (CPU/RAM/red) y limpieza de memoria.
+Dashboard web para gestión y monitoreo de streams FFmpeg en tiempo real. Control total de múltiples transmisiones simultáneas con monitoreo automático, detección de *freeze* por inactividad de frames, reinicio a medianoche, métricas de sistema (CPU / RAM / red) y limpieza de memoria.
+
+Pensado para correr 24/7 sobre un equipo Linux que recibe fuentes SRT / RTMP / HLS / HTTP y las reemite a un servidor RTMP local (nginx-rtmp) con aceleración por hardware VAAPI.
+
+---
+
+## Vista rápida del panel
+
+Al abrir `http://localhost:5006` se ve este panel principal. No tiene contraseñas: corre sólo en la red local y todos los controles son botones.
+
+![Vista general del dashboard](docs/images/dashboard-overview.png)
+
+*Captura real del dashboard con 9 streams emitiendo. La barra superior muestra el conteo de streams activos/detenidos, uso de CPU, RAM y tráfico de red en vivo.*
+
+---
+
+## Guía visual: ¿qué hace cada botón?
+
+### Cabecera (esquina superior derecha)
+
+![Cabecera con botones](docs/images/dashboard-header.png)
+
+| Botón | Símbolo | Qué hace |
+|---|---|---|
+| **📖 Docs** | `📖` | Abre esta documentación renderizada en otra pestaña (`/help`). |
+| **📊 Errores** | `📊` | Modal con los últimos 5 reinicios automáticos y errores detectados. |
+| **📝 INI** | `📝` | Abre el editor en vivo del archivo `cadena_rcn.ini`. Al guardar se aplica **solo** a los streams modificados (los demás no se reinician). |
+| **✏️ Título** | `✏️` | Cambia el nombre que aparece arriba y en la pestaña del navegador. Se guarda en `config.json`. |
+| **▶** | verde | **Inicia todos** los streams registrados (`/api/start_all`). |
+| **■** | rojo | **Detiene todos** los streams (`/api/stop_all`). |
+| **↻** | ámbar | **Reinicia toda la plataforma**: detiene streams, ejecuta `restart_platform.sh` y la UI se reconecta sola al cabo de ~3 s. |
+
+### Barra de estado (debajo del título)
+
+![Barra de estado](docs/images/dashboard-statusbar.png)
+
+- **Activas / Detenidas / Total** — conteo global en vivo (polling de 2 s).
+- **CPU / RAM** — porcentaje instantáneo del equipo.
+- **Red (enp2s0)** — Mbps de subida y bajada calculados con `psutil.net_io_counters`.
+- **● 100% operacional** — todos los streams corriendo. Cambia a *N detenido(s)* o *Sin actividad* cuando aplique.
+
+### Toolbar (buscador y toggles)
+
+![Toolbar con toggles](docs/images/dashboard-toolbar.png)
+
+- 🔍 Buscar — filtra la tabla por nombre en tiempo real.
+- **Auto-inicio** — al arrancar la app, también se inician los streams (incluso los que no tengan `autostart=true`).
+- **Auto-reinicio** — el monitor automático detecta streams congelados o caídos y los relanza.
+- **Reinicio medianoche** — entre las 00:00 y las 00:05 hace un *full restart* (libera memoria y relanza todo limpio).
+
+### Tabla principal
+
+![Tabla de streams](docs/images/dashboard-table.png)
+
+Columnas (todas ordenables clicando el header):
+
+| Columna | Significado |
+|---|---|
+| **#** | Número de fila. |
+| **Estado** | ● Emitiendo (verde) / ● Iniciando (amarillo) / ● Detenido (gris) / ● Error (rojo) / ● Reiniciando (amarillo). |
+| **Stream** | Nombre de la sección en `cadena_rcn.ini`. |
+| **PID** | PID del proceso `ffmpeg` (o `-` si está detenido). |
+| **Bitrate** | Tasa de salida actual (kbits/s). |
+| **Tamaño** | Bytes escritos por ffmpeg hasta el momento. |
+| **Velocidad** | `speed=` de ffmpeg (1.0x = tiempo real). |
+| **Uptime** | Tiempo que lleva emitiendo desde el último `start`. |
+| **RST** | Cuántas veces se ha reiniciado automáticamente. |
+
+Botones por fila (`Acciones`):
+
+| Botón | Acción |
+|---|---|
+| ▶ verde | Inicia *este* stream. |
+| ■ rojo | Detiene *este* stream. |
+| ↻ ámbar | Reinicia *este* stream. |
+| 📋 azul | Abre los **detalles** del stream (logs en vivo + comando FFmpeg generado). |
+
+---
+
+## Modales
+
+### Detalles del stream (📋 por fila)
+
+**Pestaña Logs** — las últimas 200 líneas de stderr de ffmpeg, con auto-refresh cada 2 s. Botones `↻` refrescar y `Limpiar`.
+
+![Modal de logs en vivo](docs/images/modal-details-logs.png)
+
+**Pestaña Comando** — comando `ffmpeg` que se está ejecutando, con `Original_URL`, `Destination_URL`, `FFMPEG_PRE_OPTIONS` y `FFMPEG_POST_OPTIONS` desglosados. Botón 📋 Copiar lo lleva al portapapeles.
+
+![Modal de comando FFmpeg](docs/images/modal-details-command.png)
+
+### Editor de INI (📝 en header)
+
+![Modal editor de INI](docs/images/modal-ini.png)
+
+Edita `cadena_rcn.ini` directamente. Al pulsar **💾 Guardar**:
+
+- Se hace backup automático (`cadena_rcn.ini.bak`).
+- Se valida que el nuevo contenido parse.
+- Sólo se reinician los streams **que cambiaron** (los demás ni se tocan).
+
+### Historial de errores (📊 en header)
+
+![Modal historial de errores](docs/images/modal-errors.png)
+
+Tabla con los últimos 5 reinicios automáticos: timestamp, nombre del stream, tipo (`restart` por freeze, `restart` por crash, `error` por fallo al iniciar) y el mensaje de ffmpeg asociado.
 
 ---
 
@@ -52,119 +157,46 @@ Dashboard web para gestión y monitoreo de streams FFmpeg en tiempo real. Contro
 El campo `status` puede valer:
 
 | Valor | Significado |
-|-------|-------------|
-| `stopped` | Proceso detenido o nunca iniciado |
-| `starting` | Popen ejecutado, a la espera del primer progreso |
-| `running` | FFmpeg emite progreso (`frame=`, `size=` o `time=` avanzando) |
-| `error` | Proceso murió o no se pudo iniciar |
+|---|---|
+| `stopped` | Proceso detenido o nunca iniciado. |
+| `starting` | Popen ejecutado, a la espera del primer progreso. |
+| `running` | FFmpeg emite progreso (`frame=`, `size=` o `time=` avanzando). |
+| `error` | Proceso murió o no se pudo iniciar. |
+| `restarting` | El monitor decidió reiniciarlo (freeze o crash). |
 
 ---
 
-## Actualización Parcial del INI
+## Actualización parcial del INI
 
-Cuando se guarda el archivo `cadena_rcn.ini` via la UI (`POST /api/ini/write`):
+Cuando se guarda el archivo `cadena_rcn.ini` desde la UI (`POST /api/ini/write`):
 
 1. Se hace una copia del contenido anterior en `cadena_rcn.ini.bak`.
 2. Se valida el contenido nuevo en un archivo temporal (escritura atómica `tmp + fsync + rename`).
 3. Se compara la configuración anterior con la nueva.
 4. Solo se afectan los streams que cambiaron:
-   - **Streams añadidos** → se registran e inician (si `autostart=true` o `start_all_on_boot=true`)
-   - **Streams eliminados** → se detienen y se borran del manager
-   - **Streams modificados** → se reinician con la nueva config (solo si estaban running)
-   - **Streams sin cambios** → no se tocan
+   - **Streams añadidos** → se registran e inician (si `autostart=true` o `start_all_on_boot=true`).
+   - **Streams eliminados** → se detienen y se borran del manager.
+   - **Streams modificados** → se reinician con la nueva config (sólo si estaban corriendo).
+   - **Streams sin cambios** → no se tocan.
 5. La respuesta JSON incluye `added`, `changed` y `removed` (listas de nombres).
 
 ---
 
-## Flujo de Funcionamiento
-
-### 1. Inicialización (app.py)
-
-```
-python app.py
-    │
-    ├── load_app_config()          → lee config.json
-    │                                  (start_all_on_boot, midnight_restart,
-    │                                   auto_restart, platform_title)
-    │
-    ├── initialize_streams()
-    │       │
-    │       └── Para cada sección en cadena_rcn.ini:
-    │               ├── config_parser.get_all_streams()
-    │               ├── stream_manager.register_stream(name, config)
-    │               └── Si autostart=true OR START_ALL_ON_BOOT → start_stream(name)
-    │                                                   └─ sleep(2) entre streams
-    │
-    ├── monitor.start()            → hilo daemon, check cada 10s
-    ├── scheduler.start()          → hilo daemon que calcula medianoche siguiente
-    └── app.run(host=0.0.0.0, port=5006, threaded=True)
-```
-
-### 2. Monitoreo en Tiempo Real (UI)
-
-```
-Browser (polling cada 2s)
-    │
-    └── GET /api/status
-            │
-            ├── stream_manager.get_all_status()
-            │     └── {name: stream.get_info() for name, stream in streams.items()}
-            │
-            └── get_system_stats()
-                  └── psutil: cpu_percent, virtual_memory, net_io_counters(enp2s0)
-                              → upload_mbps, download_mbps
-
-stream.get_info() retorna:
-{
-  name, status, bitrate, audio_bitrate, file_size, speed, uptime,
-  restart_count, error_message, pid, last_lines[-50:]
-}
-
-Respuesta completa de /api/status:
-{
-  "streams": { ... },
-  "summary": { "total", "running", "stopped", "all_running" },
-  "system":  { "cpu_percent", "mem_percent",
-               "net_interface", "upload_mbps", "download_mbps" }
-}
-```
-
-### 3. Hilo _read_output (por cada stream activo)
-
-```
-subprocess.Popen(env={LIBVA_DRIVER_NAME=... si vaapi_driver})
-    └── stderr.read1(4096)  ──►  split por \r y \n
-                                   │
-                                   ├── _parse_output(text)
-                                   │     ├── frame=  → marca progreso (latido)
-                                   │     ├── size=   → actualiza file_size y latido
-                                   │     ├── time=   → valida rango, actualiza last y latido
-                                   │     ├── bitrate=→ actualiza bitrate (kbits/s, Mbps, bps)
-                                   │     ├── Audio:  → audio_bitrate
-                                   │     ├── speed=  → speed
-                                   │     └── error/failed → guarda error_message
-                                   │
-                                   └── last_lines.append("[HH:MM:SS] <línea>")  [deque maxlen=1000]
-```
-
-### 4. Detección de Freeze y Reinicio Automático
+## Detección de Freeze y Reinicio Automático
 
 ```
 StreamMonitor (cada 10s)
     │
     ├── _check_freeze(name, status)
-    │       │
     │       ├── Si status != "running"           → ignora
     │       ├── Si start_time es None            → ignora
     │       ├── Si now - start_time < 90s        → warmup, ignora
-    │       │                                      (los streams IPTV/HLS tardan en
-    │       │                                       emitir el primer frame válido)
+    │       │                                      (los streams IPTV/HLS tardan
+    │       │                                       en emitir el primer frame válido)
     │       ├── Lee stream._last_frame_time
-    │       │
     │       ├── Si now - last_frame_time ≤ 60s   → reset contador, OK
     │       └── Si now - last_frame_time > 60s   → contador++
-    │                                              │
-    │                                              └── contador ≥ 6 (≈60s adicionales)
+    │                                              └─ contador ≥ 6 (≈60s adicionales)
     │                                                   → restart_stream(name, reason="frozen")
     │
     └── _check_process_health(name, status)
@@ -183,7 +215,9 @@ restart_stream(name, reason):
 
 > Con `freeze_threshold=60s` + 6 checks consecutivos + 90s de warmup, el tiempo máximo antes de actuar sobre un stream realmente congelado es de aproximadamente **2 minutos y medio** desde el último progreso real.
 
-### 5. Reinicio a Medianoche (Full Memory Clean)
+---
+
+## Reinicio a Medianoche (Full Memory Clean)
 
 ```
 Scheduler (hilo daemon)
@@ -194,39 +228,55 @@ Scheduler (hilo daemon)
             └── Cuando now.hour == 0 and now.minute < 5 and !already_executed:
                     │
                     └── full_restart()
-                            │
                             ├── stop_all_and_cleanup()
                             │       ├── stream.cleanup() × N streams
                             │       │       ├── stop() → terminate/wait(10s)/kill
                             │       │       ├── close pipes (stderr/stdout/stdin)
                             │       │       ├── last_lines.clear()
                             │       │       └── reset bitrate/size/speed/etc.
-                            │       │
                             │       └── gc.collect()
-                            │
                             ├── sleep(3)  ← pausa para liberación de recursos OS
-                            │
                             └── stream.start() × N streams  ← reinicio limpio
 ```
 
 Si el toggle `midnight_restart` está deshabilitado, el scheduler registra el evento pero no detiene los streams.
 
+### Por stream
+
+Cada `StreamInstance` mantiene:
+
+- `last_lines` → `deque(maxlen=1000)` — máximo 1000 líneas de log en memoria.
+- `_last_frame_time` → timestamp del último progreso (`frame=` / `size=` / `time=`).
+- `_last_ffmpeg_time_value`, `_last_size_value` → métricas acumulativas.
+- `_output_thread` → hilo daemon que lee stderr con `read1(4096)` y split `\r` / `\n`.
+
+### Full Restart (cleanup completo)
+
+1. `stop()` → `terminate()` → `wait(10s)` → `kill()` si no responde → cierra pipes.
+2. `last_lines.clear()` → libera referencias de strings.
+3. `gc.collect()` → fuerza Python a reclamar memoria al OS.
+4. `sleep(3)` → pausa para que el OS libere recursos.
+5. `stream.start()` × N → reinicio limpio.
+
 ---
 
-## Estructura de Archivos
+## Estructura de archivos
 
 ```
-sistema_emision/
+sistema_emision_Astra/
 ├── app.py                  # Flask app + scheduler + initialization + /help
 ├── stream_manager.py       # StreamInstance + StreamManager (singleton)
 ├── monitor.py              # StreamMonitor (freeze/crash detection con warmup)
 ├── config_parser.py        # Parser del archivo INI
-├── cadena_rcn.ini          # Configuración de streams (se edita desde UI)
-├── cadena_rcn.ini.bak      # Backup automático antes de cada guardado
-├── config.json             # Persistencia de toggles y platform_title
+├── cadena_rcn.ini          # Configuración de streams (NO se commitea)
+├── cadena_rcn.ini.example  # Plantilla sanitizada para el repo
+├── config.json             # Persistencia de toggles y platform_title (NO se commitea)
 ├── emisor_v1.sh            # Launcher con título personalizado para terminal
 ├── restart_platform.sh     # Script de reinicio completo del servicio
 ├── requirements.txt        # flask, psutil, markdown
+├── tools/
+│   └── take_screenshots.py # Generador de capturas del README (playwright)
+├── docs/images/            # Capturas usadas por el README
 ├── templates/
 │   └── index.html          # Dashboard con tabla, modales, toasts
 ├── static/
@@ -239,27 +289,27 @@ sistema_emision/
 ## API REST
 
 | Método | Endpoint | Descripción |
-|--------|----------|-------------|
-| GET | `/` | Dashboard HTML (título personalizado vía `platform_title`) |
-| GET | `/help` | Documentación: renderiza este README.md como HTML |
-| GET | `/api/status` | Estado de streams + `summary` + `system` (cpu/ram/red) |
-| POST | `/api/stream/<name>/start` | Iniciar stream |
-| POST | `/api/stream/<name>/stop` | Detener stream |
-| POST | `/api/stream/<name>/restart` | Reiniciar stream individual |
-| GET | `/api/logs/<name>?lines=N` | Obtener logs de un stream (N máx 1000) |
-| GET | `/api/stream/<name>/command` | Ver comando FFmpeg generado + config |
-| POST | `/api/start_all` | Iniciar todos los streams |
-| POST | `/api/stop_all` | Detener todos los streams |
-| POST | `/api/restart_platform` | Detener streams, lanzar `restart_platform.sh` y `os._exit(0)` |
-| GET | `/api/config` | Obtener toggles + `platform_title` |
-| POST | `/api/config` | Guardar toggles y/o `platform_title` |
-| GET | `/api/ini/read` | Leer archivo INI |
-| POST | `/api/ini/write` | Guardar INI (validación + backup + actualización parcial) |
-| GET | `/api/errors` | Historial de últimos 5 reinicios/errores |
+|---|---|---|
+| GET | `/` | Dashboard HTML (título personalizado vía `platform_title`). |
+| GET | `/help` | Documentación: renderiza este README.md como HTML. |
+| GET | `/api/status` | Estado de streams + `summary` + `system` (cpu/ram/red). |
+| POST | `/api/stream/<name>/start` | Iniciar stream. |
+| POST | `/api/stream/<name>/stop` | Detener stream. |
+| POST | `/api/stream/<name>/restart` | Reiniciar stream individual. |
+| GET | `/api/logs/<name>?lines=N` | Obtener logs de un stream (N máx 1000). |
+| GET | `/api/stream/<name>/command` | Ver comando FFmpeg generado + config. |
+| POST | `/api/start_all` | Iniciar todos los streams. |
+| POST | `/api/stop_all` | Detener todos los streams. |
+| POST | `/api/restart_platform` | Detener streams, lanzar `restart_platform.sh` y `os._exit(0)`. |
+| GET | `/api/config` | Obtener toggles + `platform_title`. |
+| POST | `/api/config` | Guardar toggles y/o `platform_title`. |
+| GET | `/api/ini/read` | Leer archivo INI. |
+| POST | `/api/ini/write` | Guardar INI (validación + backup + actualización parcial). |
+| GET | `/api/errors` | Historial de últimos 5 reinicios / errores. |
 
 ---
 
-## Formato cadena_rcn.ini
+## Formato `cadena_rcn.ini`
 
 ```ini
 [Nombre_Del_Stream]
@@ -271,39 +321,39 @@ autostart=true
 ```
 
 | Campo | Obligatorio | Descripción |
-|-------|-------------|-------------|
-| `Original_URL` | sí | Fuente a leer (HLS, RTMP, HTTP, etc.) |
-| `Destination_URL` | sí | Destino donde reemitir (normalmente RTMP) |
-| `FFMPEG_PRE_OPTIONS` | no | Flags antes de `-i`, ej. `-re -user_agent "..."` |
-| `FFMPEG_POST_OPTIONS` | no | Flags después de `-i`, ej. `-c copy -f flv` |
-| `autostart` | no | `true`/`false`. Iniciar al arranque (o en guardado del INI) |
-| `ffmpeg_path` | no | Ruta al binario ffmpeg (default `ffmpeg`) |
-| `vaapi_driver` | no | Driver VAAPI (ej. `i965`, `iHD`). Se exporta como `LIBVA_DRIVER_NAME` |
+|---|---|---|
+| `Original_URL` | sí | Fuente a leer (HLS, RTMP, HTTP, SRT, etc.). |
+| `Destination_URL` | sí | Destino donde reemitir (normalmente `rtmp://127.0.0.1:1935/live/<key>`). |
+| `FFMPEG_PRE_OPTIONS` | no | Flags antes de `-i`, ej. `-re -user_agent "..."`. |
+| `FFMPEG_POST_OPTIONS` | no | Flags después de `-i`, ej. `-c copy -f flv`. |
+| `autostart` | no | `true` / `false`. Iniciar al arranque (o en guardado del INI). |
+| `ffmpeg_path` | no | Ruta al binario ffmpeg (default `ffmpeg`). |
+| `vaapi_driver` | no | Driver VAAPI (`i965`, `iHD`). Se exporta como `LIBVA_DRIVER_NAME`. |
 
 > El comando final siempre lleva `-re` antepuesto. Ejemplo:
 > `ffmpeg -re -user_agent "Mozilla/5.0" -i <Original_URL> -c copy -f flv <Destination_URL>`
 
 ---
 
-## Toggles de Configuración (config.json)
+## Toggles de configuración (`config.json`)
 
 | Campo | Default | Efecto |
-|-------|---------|--------|
-| `start_all_on_boot` | `true` | Si true, al iniciar la app también arranca los streams con `autostart=false` |
-| `auto_restart` | `true` | Si true, el monitor reinicia streams congelados o caídos |
-| `midnight_restart` | `true` | Si true, a las 00:00–00:05 ejecuta `full_restart()` para liberar memoria |
-| `platform_title` | `Sistema de Emisión 24/7-Astra` | Título del dashboard y de la pestaña del navegador (se sanitiza contra `<>"'&`, máx 100 chars) |
+|---|---|---|
+| `start_all_on_boot` | `true` | Si true, al iniciar la app también arranca los streams con `autostart=false`. |
+| `auto_restart` | `true` | Si true, el monitor reinicia streams congelados o caídos. |
+| `midnight_restart` | `true` | Si true, a las 00:00–00:05 ejecuta `full_restart()` para liberar memoria. |
+| `platform_title` | `Sistema de Emisión 24/7-Astra` | Título del dashboard y de la pestaña del navegador (se sanitiza contra `<>"'&`, máx 100 chars). |
 
 `platform_title` se puede editar desde la UI con el botón **✏️ Título**; al guardar se persiste en `config.json` y se aplica al `<h1>` y al `document.title`.
 
 ---
 
-## Métricas de Sistema (`get_system_stats`)
+## Métricas de sistema (`get_system_stats`)
 
-Se exponen en `/api/status > system` y se muestran en la barra de estado superior:
+Se exponen en `/api/status > system` y se muestran en la barra de estado superior.
 
 | Métrica | Fuente |
-|---------|--------|
+|---|---|
 | `cpu_percent` | `psutil.cpu_percent(interval=None)` |
 | `mem_percent` | `psutil.virtual_memory().percent` |
 | `net_interface` | `enp2s0` (constante `NET_INTERFACE` en `app.py`) |
@@ -311,105 +361,27 @@ Se exponen en `/api/status > system` y se muestran en la barra de estado superio
 | `download_mbps` | Δ `bytes_recv` × 8 / Δt / 1e6 |
 
 El indicador textual del estado global cambia según `summary.all_running`:
-- todos corriendo → **● 100% operacional**
-- alguno detenido → **● N detenido(s)**
-- ninguno corriendo → **● Sin actividad**
+
+- todos corriendo → **● 100% operacional**.
+- alguno detenido → **● N detenido(s)**.
+- ninguno corriendo → **● Sin actividad**.
 
 ---
 
-## Gestión de Memoria
+## Toasts (notificaciones)
 
-### Por Stream
+Las operaciones de iniciar / detener / reiniciar / mostrar logs / editar título / guardar INI muestran un toast temporal arriba a la derecha:
 
-Cada `StreamInstance` mantiene:
-- `last_lines` → `deque(maxlen=1000)` — máximo 1000 líneas de log en memoria
-- `_last_frame_time` → timestamp del último progreso (frame/size/time)
-- `_last_ffmpeg_time_value`, `_last_size_value` → métricas acumulativas
-- `_output_thread` → hilo daemon que lee stderr con `read1(4096)` y split `\r`/`\n`
-
-### Full Restart (cleanup completo)
-
-1. `stop()` → `terminate()` → `wait(10s)` → `kill()` si no responde → cierra pipes
-2. `last_lines.clear()` → libera referencias de strings
-3. `gc.collect()` → fuerza Python a reclamar memoria al OS
-4. `sleep(3)` → pausa para que el OS libere recursos
-5. `stream.start()` × N → reinicio limpio
-
----
-
-## Estructura de la UI
-
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│ 📺 Sistema de Emisión 24/7   [📖 Docs] [📊 Errores] [📝 INI]            │
-│                               [✏️ Título] [▶] [■] [↻]                    │
-├──────────────────────────────────────────────────────────────────────────┤
-│  Activas: 8 │ Detenidas: 2 │ Total: 10 │ CPU 12.4% │ RAM 31.0% │        │
-│                                                  Red ↑1.2 ↓45.6 Mbps    │
-│                                       ● 2 detenido(s)                    │
-├──────────────────────────────────────────────────────────────────────────┤
-│ [🔍 Buscar...]    [Auto-inicio] [Auto-reinicio] [Reinicio medianoche]    │
-├────┬──┬────────┬─────┬────────┬───────┬────────┬────────┬────────┬──────┤
-│ #  │St│ Stream │ PID │Bitrate │ Tam.  │ Vel.   │ Uptime │  RST   │ Acc. │
-├────┼──┼────────┼─────┼────────┼───────┼────────┼────────┼────────┼──────┤
-│ 1  │● │ nombre │ 123 │500 kbps│ 1.2MB │ 1.0x   │ 2h 15m │   3    │▶■↻📋│
-└────┴──┴────────┴─────┴────────┴───────┴────────┴────────┴────────┴──────┘
-│                                           Actualizando cada 2s | -re ... │
-└──────────────────────────────────────────────────────────────────────────┘
-```
-
-### Botones del header
-
-| Botón | Acción |
-|-------|--------|
-| 📖 Docs | Abre `/help` (este README renderizado) |
-| 📊 Errores | Modal con últimos 5 reinicios/errores (`/api/errors`) |
-| 📝 INI | Modal editor de `cadena_rcn.ini` (`/api/ini/read|write`) |
-| ✏️ Título | Prompt para renombrar `platform_title` (persiste en `config.json`) |
-| ▶ | Inicia todos los streams (`/api/start_all`) |
-| ■ | Detiene todos los streams (`/api/stop_all`) |
-| ↻ | Reinicia toda la plataforma: detiene streams, lanza `restart_platform.sh` y la UI se reconecta automáticamente |
-
-### Columnas ordenables (click en header)
-
-`#` · `Estado` · `Stream` · `PID` · `Bitrate` · `Tamaño` · `Velocidad` · `Uptime` · `RST`
-
-Click alterna asc/desc; las flechas se actualizan en cada header.
-
-### Estado → etiqueta y color
-
-| `status` | Etiqueta | Punto |
-|----------|----------|-------|
-| `running` | Emitiendo | verde |
-| `starting` | Iniciando | amarillo |
-| `stopped` | Detenido | gris |
-| `error` | Error | rojo |
-| `restarting` | Reiniciando | amarillo |
-
----
-
-## Toasts (Notificaciones)
-
-Operaciones de iniciar/detener/reiniciar/show command/show logs/editar título/guardar INI muestran toast temporal:
-
-- ✓ Éxito → verde
-- ✗ Error → rojo
-- ⚠ Warning → naranja
-- ℹ Info → azul
-
----
-
-## Modales
-
-1. **Detalles (Logs + Comando)** — Botón 📋 unificado con subpestañas:
-   - **Logs**: `GET /api/logs/<name>?lines=200` con auto-refresh cada 2s, fondo oscuro monoespaciado, botón **Limpiar**
-   - **Comando**: `GET /api/stream/<name>/command` con detalle de Original_URL, Destination_URL, FFMPEG_PRE_OPTIONS, FFMPEG_POST_OPTIONS, más botón **📋 Copiar**
-2. **INI Editor** — `GET/POST /api/ini/read|write`. Muestra `✓ +N ~M -K` tras guardar; **no se aplica** si el nuevo INI no parsea.
-3. **Historial de Errores** — Botón 📊 Errores en header, muestra tabla con los últimos 5 reinicios/errores con: índice, fecha, stream, tipo (Reinicio/Error) y detalle del mensaje de FFmpeg. Los datos los proporciona `GET /api/errors`.
+- ✓ Éxito → **verde**.
+- ✗ Error → **rojo**.
+- ⚠ Warning → **naranja**.
+- ℹ Info → **azul**.
 
 ---
 
 ## Dependencias
+
+Runtime (`requirements.txt`):
 
 ```
 flask>=2.3.0
@@ -417,7 +389,19 @@ psutil>=5.9.0
 markdown>=3.5      # usado por /help (import lazy)
 ```
 
-Instalar con: `pip install -r requirements.txt`
+Instalar con:
+
+```bash
+pip install -r requirements.txt
+```
+
+Si además quieres regenerar las capturas del README, instala Playwright aparte:
+
+```bash
+pip install playwright
+python -m playwright install chromium
+python tools/take_screenshots.py
+```
 
 ---
 
@@ -425,62 +409,55 @@ Instalar con: `pip install -r requirements.txt`
 
 ```bash
 # Directo
-cd sistema_emision
+cd sistema_emision_Astra
 python app.py
 
 # Con título personalizado en terminal
 ./emisor_v1.sh
 
-# Con xfce4-terminal (autostart)
-xfce4-terminal --hold -e "bash -c 'cd /home/difusor01/Nextcloud/99_Multimedia/RTMP/Linea_Stream/sistema_emision && sleep 2 && ./emisor_v1.sh; exec bash'" &
+# Con xfce4-terminal (autostart de sesión)
+xfce4-terminal --hold -e "bash -c 'cd /ruta/al/sistema_emision_Astra && sleep 2 && ./emisor_v1.sh; exec bash'" &
 ```
 
-Acceso: `http://localhost:5006`
+Acceso: `http://localhost:5006`.
 
 Reinicio completo desde la UI: botón ↻ del header (detiene streams, ejecuta `restart_platform.sh` y la app se relanza; la UI se reconecta automáticamente).
 
 ---
 
-## Manejo de Errores
+## Manejo de errores
 
-- **Stream congelado**: warmup 90s + 60s sin progreso de `frame=`/`size=`/`time=` × 6 checks → restart automático (`reason="frozen"`)
-- **Process muerto**: `status == "running"` pero `poll() != None` → restart (`reason="process_died"`), error capturado del último log
-- **Error al iniciar**: captura excepción, `status="error"`, mensaje visible
-- **API error**: try/except en todos los endpoints, retorna JSON con `success: false` y `error`
-
----
-
-## Reinicio a Medianoche
-
-El scheduler ejecuta `full_restart()` cada noche entre las 00:00 y las 00:05:
-1. Detiene todos los procesos FFmpeg y cierra sus pipes
-2. Limpia buffers de log (`last_lines.clear()`)
-3. Llama `gc.collect()` para liberar memoria
-4. Espera 3 segundos para que el OS libere recursos
-5. Reinicia todos los streams desde cero
-
-Esto previene acumulación de memoria por logs o recursos no liberados durante operación continua.
+- **Stream congelado** — warmup 90 s + 60 s sin progreso de `frame=`/`size=`/`time=` × 6 checks → restart automático (`reason="frozen"`).
+- **Process muerto** — `status == "running"` pero `poll() != None` → restart (`reason="process_died"`), error capturado del último log.
+- **Error al iniciar** — captura excepción, `status="error"`, mensaje visible.
+- **API error** — try / except en todos los endpoints, retorna JSON con `success: false` y `error`.
 
 ---
 
 ## Mantenimiento
 
 ### Ver logs del servidor (consola donde corre la app)
+
 ```bash
-# Los print() y logger.info() del scheduler y monitor van a stdout/stderr
+# Los print() y logger.info() del scheduler y monitor van a stdout/stderr.
 ```
 
 ### Ver procesos FFmpeg activos
+
 ```bash
 ps aux | grep ffmpeg
 ```
 
 ### Reiniciar manualmente sin esperar medianoche
+
 - **Plataforma completa**: botón ↻ del header, o
+
   ```bash
-  bash restart_platform.sh /tmp/kilo/emision_app.log
+  bash restart_platform.sh /tmp/emision_app.log
   ```
-- **Solo streams**:
+
+- **Sólo streams**:
+
   ```bash
   curl -X POST http://localhost:5006/api/stop_all
   curl -X POST http://localhost:5006/api/start_all
@@ -488,18 +465,41 @@ ps aux | grep ffmpeg
   ```
 
 ### Editar INI y guardar
-Botón 📝 INI en la UI → abre editor → guardar → actualización parcial:
-- Streams nuevos → se inician
-- Streams eliminados → se detienen y eliminan
-- Streams modificados → se reinician (si estaban corriendo)
-- Streams sin cambios → no se tocan
-- Si el nuevo INI no parsea → no se aplica y se devuelve error
-- Siempre se respalda en `cadena_rcn.ini.bak` antes de sobrescribir
+
+Botón **📝 INI** en la UI → abre editor → guardar → actualización parcial:
+
+- Streams nuevos → se inician.
+- Streams eliminados → se detienen y eliminan.
+- Streams modificados → se reinician (si estaban corriendo).
+- Streams sin cambios → no se tocan.
+- Si el nuevo INI no parsea → no se aplica y se devuelve error.
+- Siempre se respalda en `cadena_rcn.ini.bak` antes de sobrescribir.
 
 ### Cambiar el título de la plataforma
-Botón ✏️ Título → introduce el nuevo nombre → Enter. Se guarda en `config.json > platform_title`, se aplica al `<h1>` del header y al `document.title` del navegador. Se sanitiza contra `< > " ' &` y se trunca a 100 caracteres.
+
+Botón **✏️ Título** → introduce el nuevo nombre → Enter. Se guarda en `config.json > platform_title`, se aplica al `<h1>` del header y al `document.title` del navegador. Se sanitiza contra `< > " ' &` y se trunca a 100 caracteres.
 
 ### Ver historial de errores
-Botón 📊 Errores en header → modal con tabla de últimos 5 reinicios:
-- Timestamp, stream, tipo (Reinicio/Error) y mensaje de error de FFmpeg
-- Útil para diagnosticar problemas recurrentes en links o comandos
+
+Botón **📊 Errores** en header → modal con tabla de últimos 5 reinicios:
+
+- Timestamp, stream, tipo (Reinicio / Error) y mensaje de error de FFmpeg.
+- Útil para diagnosticar problemas recurrentes en links o comandos.
+
+---
+
+## Sobre la publicación de capturas
+
+Las capturas del README se generan con Playwright contra la app en vivo:
+
+```bash
+python tools/take_screenshots.py
+```
+
+El script conecta a `http://127.0.0.1:5006`, espera a que la tabla se llene y guarda cada PNG en `docs/images/`. Útil cuando se quiere actualizar la documentación tras un cambio visual en la UI.
+
+---
+
+## Licencia
+
+Uso interno. Sin contraseñas porque el panel corre únicamente en LAN; no exponer el puerto 5006 a Internet sin protección adicional.
