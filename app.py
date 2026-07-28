@@ -20,7 +20,7 @@ app = Flask(__name__)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config_parser import load_config, load_config_from_content
+from config_parser import load_config, load_config_from_content, load_deployment_overrides
 from monitor import monitor
 from stream_manager import stream_manager
 
@@ -164,6 +164,43 @@ def _validate_config_name(name):
     return safe
 
 NET_INTERFACE = "enp2s0"
+_DEFAULT_NET_INTERFACE = "enp2s0"
+
+
+def _apply_deployment_overrides():
+    """Lee [servidor] del INI activo y sobreescribe Title/Network/toggles.
+    Se llama al arranque y cada vez que se activa una config nueva.
+    """
+    global PLATFORM_TITLE, NET_INTERFACE
+    global START_ALL_ON_BOOT, MIDNIGHT_RESTART_ENABLED, AUTO_RESTART_ENABLED
+    try:
+        overrides = load_deployment_overrides(resolve_active_ini_path())
+    except Exception as e:
+        logger.warning(f"No se pudieron aplicar overrides de despliegue: {e}")
+        return
+    if overrides.get("title"):
+        PLATFORM_TITLE = overrides["title"]
+        app_config["platform_title"] = PLATFORM_TITLE
+    if overrides.get("network"):
+        NET_INTERFACE = overrides["network"]
+    for key in ("start_all_on_boot", "midnight_restart", "auto_restart"):
+        if overrides.get(key) is not None:
+            val = bool(overrides[key])
+            app_config[key] = val
+            if key == "start_all_on_boot":
+                START_ALL_ON_BOOT = val
+            elif key == "midnight_restart":
+                MIDNIGHT_RESTART_ENABLED = val
+            elif key == "auto_restart":
+                AUTO_RESTART_ENABLED = val
+    try:
+        _NET_PREV["time"] = time.time()
+        cnt = psutil.net_io_counters(pernic=True).get(NET_INTERFACE)
+        if cnt:
+            _NET_PREV["bytes_sent"] = cnt.bytes_sent
+            _NET_PREV["bytes_recv"] = cnt.bytes_recv
+    except Exception:
+        pass
 _NET_LOCK = threading.Lock()
 _NET_PREV = {"time": time.time(), "bytes_sent": 0, "bytes_recv": 0}
 _net_counters = psutil.net_io_counters(pernic=True).get(NET_INTERFACE)
@@ -253,6 +290,8 @@ MIDNIGHT_RESTART_ENABLED = app_config.get("midnight_restart", True)
 AUTO_RESTART_ENABLED = app_config.get("auto_restart", True)
 PLATFORM_TITLE = app_config.get("platform_title", _DEFAULT_TITLE)
 _CONFIG_LOCK = threading.Lock()
+
+_apply_deployment_overrides()
 
 
 class MidnightRestartScheduler:
@@ -621,6 +660,7 @@ def get_config():
         "midnight_restart": MIDNIGHT_RESTART_ENABLED,
         "auto_restart": AUTO_RESTART_ENABLED,
         "platform_title": PLATFORM_TITLE,
+        "network": NET_INTERFACE,
     })
 
 
@@ -789,11 +829,15 @@ def configs_activate():
     except (configparser.Error, OSError, ValueError) as e:
         return jsonify({"success": False, "error": f"Error cargando {base}: {e}"}), 500
 
+    _apply_deployment_overrides()
+
     return jsonify({
         "success": True,
         "active": base,
         "loaded": loaded,
         "started": started,
+        "platform_title": PLATFORM_TITLE,
+        "network": NET_INTERFACE,
     })
 
 

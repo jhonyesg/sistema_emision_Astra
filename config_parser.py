@@ -1,4 +1,5 @@
 import configparser
+import os
 
 
 class ConfigParser:
@@ -60,3 +61,52 @@ def load_config(ini_path):
 
 def load_config_from_content(content):
     return ConfigParser(content=content)
+
+
+def load_deployment_overrides(ini_path=None, content=None):
+    """Lee claves opcionales del bloque [servidor] para sobreescribir defaults.
+
+    Claves reconocidas:
+      Title              → nombre de plataforma (sobreescribe config.json)
+      Network            → interfaz de red para stats de red (enp2s0, eth0, ...)
+      Night_Restart      → bool, reinicio a medianoche (00:00–00:05)
+      Auto_Restart       → bool, monitor re-lanza streams congelados/caídos
+      Start_All_On_Boot  → bool, arrancar streams en el boot
+
+    Las claves no presentes devuelven None, y la app decide si caer al
+    config.json / constante hardcodeada.
+    """
+    out = {
+        "title": None,
+        "network": None,
+        "midnight_restart": None,
+        "auto_restart": None,
+        "start_all_on_boot": None,
+    }
+    try:
+        if content is not None:
+            cp = configparser.ConfigParser()
+            cp.read_string(content)
+        elif ini_path and os.path.isfile(ini_path):
+            cp = configparser.ConfigParser()
+            cp.read(ini_path, encoding="utf-8")
+        else:
+            return out
+        if not cp.has_section("servidor"):
+            return out
+        s = cp["servidor"]
+        if "Title" in s:
+            out["title"] = s.get("Title", "").strip() or None
+        if "Network" in s:
+            out["network"] = s.get("Network", "").strip() or None
+        for ini_key, out_key in [
+            ("Night_Restart", "midnight_restart"),
+            ("Auto_Restart", "auto_restart"),
+            ("Start_All_On_Boot", "start_all_on_boot"),
+        ]:
+            if ini_key in s:
+                v = s.get(ini_key, "").strip().lower()
+                out[out_key] = v in ("true", "1", "yes", "on")
+    except Exception:
+        return out
+    return out
