@@ -767,3 +767,35 @@ footer .separator {
     from { opacity: 1; transform: translateX(0) scale(1); }
     to { opacity: 0; transform: translateX(60px) scale(0.95); }
 }
+
+/* ----- Selector de configuración activa ----- */
+.config-select {
+    background: #1f2530;
+    color: #e0e6f0;
+    border: 1px solid #3a4252;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 13px;
+    max-width: 240px;
+    cursor: pointer;
+}
+.config-select:hover { border-color: #5a6373; }
+.config-select:disabled { opacity: 0.5; cursor: not-allowed; }
+.config-select option { background: #1f2530; color: #e0e6f0; }
+
+/* ----- Modal "Nueva configuración" ----- */
+.form-row { margin-bottom: 14px; }
+.form-row label { display: block; font-size: 13px; color: #b0bac8; margin-bottom: 4px; }
+.form-row input[type="text"] {
+    width: 100%;
+    padding: 8px 10px;
+    background: #161b25;
+    color: #e0e6f0;
+    border: 1px solid #3a4252;
+    border-radius: 6px;
+    font-size: 14px;
+    box-sizing: border-box;
+}
+.form-row input[type="text"]:focus { outline: none; border-color: #4a90e2; }
+.form-actions { margin-top: 16px; display: flex; gap: 10px; justify-content: flex-end; }
+.form-status { margin-top: 8px; font-size: 13px; min-height: 18px; }

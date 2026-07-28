@@ -18,6 +18,10 @@
                 <a href="/help" target="_blank" class="btn btn-secondary">📖 Docs</a>
                 <button class="btn btn-secondary" onclick="showErrors()">📊 Errores</button>
                 <button class="btn btn-secondary" onclick="editIni()">📝 INI</button>
+                <select id="config-select" class="config-select" onchange="activateConfig(this.value)" title="Configuración activa en db/">
+                    <option value="">— cargando…</option>
+                </select>
+                <button class="btn btn-secondary" onclick="showNewConfig()" title="Crear nueva configuración en db/">➕ Nuevo INI</button>
                 <button class="btn btn-secondary" onclick="editTitle()" title="Editar título">✏️ Título</button>
                 <button id="btn-start-all" class="btn btn-success" onclick="startAll()">▶</button>
                 <button id="btn-stop-all" class="btn btn-danger" onclick="stopAll()">■</button>
@@ -121,7 +125,7 @@
     <div id="ini-modal" class="modal">
         <div class="modal-content modal-xl">
             <div class="modal-header">
-                <h2>📝 Editar cadena_rcn.ini</h2>
+                <h2 id="ini-modal-title">📝 Editar INI</h2>
                 <button class="modal-close" onclick="closeIniModal()">&times;</button>
             </div>
             <div class="modal-body">
@@ -129,9 +133,38 @@
                     <button class="btn btn-sm btn-primary" onclick="saveIni()">💾 Guardar</button>
                     <button class="btn btn-sm" onclick="loadIni()">↻</button>
                     <span id="ini-status" class="ini-status"></span>
+                    <span id="ini-active-label" class="ini-status" style="margin-left:auto;"></span>
                 </div>
                 <textarea id="ini-content" class="ini-content" spellcheck="false"></textarea>
                 <p class="ini-warning">⚠️ Solo se reinician los streams modificados</p>
+            </div>
+        </div>
+    </div>
+
+    <div id="new-config-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>➕ Nueva configuración</h2>
+                <button class="modal-close" onclick="closeNewConfig()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-row">
+                    <label for="new-config-name">Nombre (sin extensión, sin espacios):</label>
+                    <input id="new-config-name" type="text" placeholder="ej: 2_canal_x" maxlength="80" autocomplete="off">
+                </div>
+                <div class="form-row">
+                    <label for="new-config-content">Contenido INI (opcional, si lo dejas vacío se crea una plantilla):</label>
+                    <textarea id="new-config-content" class="ini-content" style="min-height:220px;" spellcheck="false"
+                        placeholder="[servidor]&#10;FFMPEG_PATH=/usr/bin/ffmpeg&#10;&#10;[01_Ejemplo]&#10;Original_URL=https://..."></textarea>
+                </div>
+                <div class="form-row">
+                    <label><input type="checkbox" id="new-config-activate" checked> Activar después de crear</label>
+                </div>
+                <div id="new-config-status" class="form-status"></div>
+                <div class="form-actions">
+                    <button class="btn btn-primary" onclick="createConfig()">💾 Crear</button>
+                    <button class="btn" onclick="closeNewConfig()">Cancelar</button>
+                </div>
             </div>
         </div>
     </div>
@@ -197,6 +230,146 @@
                 updateUI(data);
             } catch (error) {
                 console.error('Error fetching status:', error);
+            }
+        }
+
+        async function fetchConfigs() {
+            try {
+                const response = await fetch(`${API_BASE}/configs`);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const data = await response.json();
+                renderConfigSelect(data);
+                const lbl = document.getElementById('ini-active-label');
+                if (lbl) {
+                    lbl.textContent = data.active ? `📦 ${data.active}` : '';
+                }
+                const ttl = document.getElementById('ini-modal-title');
+                if (ttl) {
+                    ttl.textContent = data.active ? `📝 Editar db/${data.active}` : '📝 Editar INI';
+                }
+            } catch (error) {
+                console.error('Error fetching configs:', error);
+            }
+        }
+
+        function renderConfigSelect(data) {
+            const sel = document.getElementById('config-select');
+            if (!sel) return;
+            const configs = data.configs || [];
+            const active = data.active || '';
+            sel.innerHTML = '';
+            if (configs.length === 0) {
+                const opt = document.createElement('option');
+                opt.value = '';
+                opt.textContent = '— sin INIs —';
+                sel.appendChild(opt);
+                sel.disabled = true;
+                return;
+            }
+            sel.disabled = false;
+            for (const c of configs) {
+                const opt = document.createElement('option');
+                opt.value = c.name;
+                opt.textContent = `${c.active ? '★ ' : '  '}${c.name}  (${c.streams} stream${c.streams === 1 ? '' : 's'})`;
+                if (c.name === active) opt.selected = true;
+                sel.appendChild(opt);
+            }
+            sel.dataset.active = active;
+            sel.dataset.env = data.env_override ? '1' : '';
+        }
+
+        async function activateConfig(name) {
+            if (!name) return;
+            const sel = document.getElementById('config-select');
+            const wasActive = sel.dataset.active || '';
+            if (name === wasActive) return;
+            try {
+                showToast(`Cambiando a db/${name}…`, 'info', 4000);
+                const res = await fetch(`${API_BASE}/configs/activate`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({name})
+                });
+                const data = await res.json();
+                if (!data.success) {
+                    showToast(`Error: ${data.error || 'desconocido'}`, 'error', 5000);
+                    sel.value = wasActive;
+                    return;
+                }
+                showToast(`✓ Activo: db/${data.active} (${data.started}/${data.loaded} streams)`, 'success', 4000);
+                await fetchConfigs();
+                await fetchStatus();
+            } catch (e) {
+                showToast('Error de conexión', 'error');
+                sel.value = wasActive;
+            }
+        }
+
+        function showNewConfig() {
+            document.getElementById('new-config-name').value = '';
+            document.getElementById('new-config-content').value = '';
+            document.getElementById('new-config-activate').checked = true;
+            document.getElementById('new-config-status').textContent = '';
+            document.getElementById('new-config-modal').style.display = 'flex';
+            setTimeout(() => document.getElementById('new-config-name').focus(), 50);
+        }
+
+        function closeNewConfig() {
+            document.getElementById('new-config-modal').style.display = 'none';
+        }
+
+        async function createConfig() {
+            const nameInput = document.getElementById('new-config-name');
+            const content = document.getElementById('new-config-content').value;
+            const activate = document.getElementById('new-config-activate').checked;
+            const status = document.getElementById('new-config-status');
+            const name = nameInput.value.trim();
+            if (!name) {
+                status.textContent = '✗ Escribe un nombre.';
+                status.style.color = '#ff5e5e';
+                return;
+            }
+            status.textContent = 'Creando…';
+            status.style.color = '#888';
+            try {
+                const res = await fetch(`${API_BASE}/configs`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({name, content: content || null, activate})
+                });
+                const data = await res.json();
+                if (!data.success) {
+                    status.textContent = `✗ ${data.error || 'error'}`;
+                    status.style.color = '#ff5e5e';
+                    return;
+                }
+                status.textContent = `✓ Creado db/${data.name}`;
+                status.style.color = '#4caf50';
+                showToast(`✓ db/${data.name} creado`, 'success');
+                await fetchConfigs();
+                if (activate) {
+                    await fetchStatus();
+                }
+                setTimeout(closeNewConfig, 700);
+            } catch (e) {
+                status.textContent = '✗ Error de conexión';
+                status.style.color = '#ff5e5e';
+            }
+        }
+
+        async function deleteConfig(name) {
+            if (!confirm(`¿Borrar db/${name}? Esta acción no se puede deshacer.`)) return;
+            try {
+                const res = await fetch(`${API_BASE}/configs/${encodeURIComponent(name)}`, { method: 'DELETE' });
+                const data = await res.json();
+                if (!data.success) {
+                    showToast(`Error: ${data.error}`, 'error', 5000);
+                    return;
+                }
+                showToast(`✓ db/${name} borrado`, 'success');
+                await fetchConfigs();
+            } catch (e) {
+                showToast('Error de conexión', 'error');
             }
         }
 
@@ -649,13 +822,15 @@
         }
 
         document.addEventListener('keydown', function(e) {
-            if (e.key === 'Escape') { closeIniModal(); closeDetailsModal(); closeErrorsModal(); }
+            if (e.key === 'Escape') { closeIniModal(); closeDetailsModal(); closeErrorsModal(); closeNewConfig(); }
         });
 
         setupSortHandlers();
         fetchConfig();
+        fetchConfigs();
         fetchStatus();
         setInterval(fetchStatus, POLL_INTERVAL);
+        setInterval(fetchConfigs, 15000);
     </script>
 </body>
 </html>

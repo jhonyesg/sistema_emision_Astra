@@ -49,6 +49,35 @@ async def main():
         # Streams table only
         await shoot_clip(page, page.locator(".table-container"), "dashboard-table.png")
 
+        # New INI modal — open in a fresh page so we don't disturb subsequent captures
+        try:
+            npage = await ctx.new_page()
+            await npage.goto(BASE + "/", wait_until="networkidle")
+            await npage.wait_for_function(
+                "document.querySelectorAll('#config-select option').length > 0 && "
+                "!document.querySelector('#config-select option').textContent.includes('cargando')",
+                timeout=15000,
+            )
+            await npage.wait_for_timeout(800)
+            await npage.locator("button", has_text="➕ Nuevo INI").click()
+            await npage.wait_for_selector("#new-config-modal", state="visible", timeout=5000)
+            await npage.wait_for_timeout(300)
+            await npage.locator("#new-config-name").fill("2_pruebas")
+            await npage.locator("#new-config-content").fill(
+                "[servidor]\nFFMPEG_PATH=/usr/bin/ffmpeg\n\n"
+                "[01_Ejemplo]\n"
+                "Original_URL=https://origen.example.com/stream\n"
+                "Destination_URL=rtmp://127.0.0.1:1935/live/ejemplo\n"
+                "FFMPEG_PRE_OPTIONS=-re\n"
+                "FFMPEG_POST_OPTIONS=-c copy -f flv\n"
+                "autostart=true\n"
+            )
+            await npage.wait_for_timeout(150)
+            await shoot_clip(npage, npage.locator("#new-config-modal .modal-content"), "modal-new-config.png")
+            await npage.close()
+        except Exception as exc:
+            print(f"[warn] new-config modal screenshot skipped: {exc}")
+
         # Details modal: Logs tab
         await page.locator("#streams-tbody tr .cell-actions .btn-info").first.click()
         await page.wait_for_selector("#details-modal", state="visible", timeout=5000)
@@ -140,7 +169,7 @@ async def main():
         await page.wait_for_timeout(2500)
 
         # INI modal
-        await page.locator("button", has_text="INI").click()
+        await page.locator("button", has_text="📝 INI").click()
         await page.wait_for_selector("#ini-modal", timeout=5000)
         await page.wait_for_function(
             "document.getElementById('ini-content').value.includes('[01_Telemedellin]')",

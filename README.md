@@ -4,6 +4,50 @@ Dashboard web para gestión y monitoreo de streams FFmpeg en tiempo real. Contro
 
 Pensado para correr 24/7 sobre un equipo Linux que recibe fuentes SRT / RTMP / HLS / HTTP y las reemite a un servidor RTMP local (nginx-rtmp) con aceleración por hardware VAAPI.
 
+## Despliegues múltiples (carpeta `db/`)
+
+El sistema carga **una** configuración `.ini` a la vez desde `db/`. Cada archivo es una variante de despliegue (cliente, canal, entorno). Sólo cambia ese archivo; el resto del código es el mismo entre máquinas.
+
+```
+sistema_emision_Astra/
+├── db/
+│   ├── 1_default.ini         ← config activa en este servidor
+│   ├── 2_cliente_x.ini
+│   └── 3_pruebas.ini
+├── app.py
+└── …
+```
+
+### Selección de la config activa (prioridad)
+
+1. **Variable de entorno** `ASTRA_INI=db/2_cliente_x.ini` → para Docker, CI o pruebas puntuales.
+2. **`config.json > active_config`** → elección persistente, editable desde la UI.
+3. **Primer** archivo `*.ini` alfabético en `db/`.
+4. Legado: `cadena_rcn.ini` en la raíz.
+
+### En la UI
+
+En el header aparece un selector con todas las configs de `db/` y dos botones nuevos:
+
+![Cabecera con selector de config](docs/images/dashboard-header.png)
+
+- **Selector** (★ nombre activo, los demás con su número de streams). Cambiar la selección hace `stop_all` y vuelve a arrancar con la config elegida.
+- **➕ Nuevo INI** abre un modal para crear una config nueva:
+
+![Modal de nueva configuración](docs/images/modal-new-config.png)
+
+### En el shell
+
+```bash
+# Primera instalación en una máquina nueva (clona el repo y escoge base)
+python app.py --init          # migra cadena_rcn.ini de la raíz, o crea db/1_local.ini
+
+# Override puntual sin tocar archivos
+ASTRA_INI=db/3_pruebas.ini python app.py
+```
+
+`db/*.ini` y `db/*.ini.bak` están en `.gitignore` — cada despliegue mantiene sus datos fuera del repo.
+
 ---
 
 ## Vista rápida del panel
@@ -95,11 +139,23 @@ Botones por fila (`Acciones`):
 
 ![Modal editor de INI](docs/images/modal-ini.png)
 
-Edita `cadena_rcn.ini` directamente. Al pulsar **💾 Guardar**:
+Edita el **INI activo** (`db/<active>.ini`). El título del modal muestra el archivo que se va a guardar (ej.: `📝 Editar db/1_default.ini`). Al pulsar **💾 Guardar**:
 
-- Se hace backup automático (`cadena_rcn.ini.bak`).
+- Se hace backup automático (`<active>.ini.bak`).
 - Se valida que el nuevo contenido parse.
 - Sólo se reinician los streams **que cambiaron** (los demás ni se tocan).
+
+### Selector de config activa (dropdown en header)
+
+![Cabecera con selector](docs/images/dashboard-header.png)
+
+Lista todos los `db/*.ini` y muestra con ★ la activa. Al elegir otra, hace `stop_all`, recarga el INI y arranca los streams marcados con `autostart=true` (o todos si `start_all_on_boot=true`). Devuelve `{active, loaded, started}` igual que el guardado de INI.
+
+### Crear nueva configuración (➕ Nuevo INI)
+
+![Modal nueva configuración](docs/images/modal-new-config.png)
+
+Pide un nombre (sin extensión, sólo letras / números / guiones) y opcionalmente el contenido INI (si se deja vacío se crea con una plantilla de un stream de ejemplo). Marca "Activar después de crear" para que entre a funcionar de inmediato.
 
 ### Historial de errores (📊 en header)
 
@@ -264,25 +320,48 @@ Cada `StreamInstance` mantiene:
 
 ```
 sistema_emision_Astra/
-├── app.py                  # Flask app + scheduler + initialization + /help
+├── app.py                  # Flask app + scheduler + initialization + /help + multi-config
 ├── stream_manager.py       # StreamInstance + StreamManager (singleton)
 ├── monitor.py              # StreamMonitor (freeze/crash detection con warmup)
-├── config_parser.py        # Parser del archivo INI
-├── cadena_rcn.ini          # Configuración de streams (NO se commitea)
-├── cadena_rcn.ini.example  # Plantilla sanitizada para el repo
-├── config.json             # Persistencia de toggles y platform_title (NO se commitea)
+├── config_parser.py        # Parser del archivo INI (soporta path o content)
+├── db/                     # Configuraciones de despliegue (una por .ini, NO se commitean)
+│   ├── .gitkeep
+│   ├── README.md
+│   └── 1_default.ini
+├── cadena_rcn.ini.example  # Plantilla sanitizada para el repo (usada por --init)
+├── config.json             # Persistencia de toggles + platform_title + active_config (NO se commitea)
 ├── emisor_v1.sh            # Launcher con título personalizado para terminal
 ├── restart_platform.sh     # Script de reinicio completo del servicio
 ├── requirements.txt        # flask, psutil, markdown
+├── requirements-dev.txt    # playwright (sólo para regenerar capturas)
 ├── tools/
 │   └── take_screenshots.py # Generador de capturas del README (playwright)
 ├── docs/images/            # Capturas usadas por el README
 ├── templates/
-│   └── index.html          # Dashboard con tabla, modales, toasts
+│   └── index.html          # Dashboard con tabla, modales, toasts, selector de config
 ├── static/
 │   └── style.css           # Estilos completos
 └── README.md               # Este archivo
 ```
+
+## Desplegar en una máquina nueva
+
+```bash
+git clone <repo>
+cd sistema_emision_Astra
+pip install -r requirements.txt
+
+# Opción A: crear un db/1_local.ini desde la plantilla
+python app.py --init
+
+# Opción B: clonar la config desde otro servidor
+scp otro-servidor:sistema_emision_Astra/db/1_default.ini db/1_local.ini
+
+# Arrancar
+python app.py
+```
+
+Acceso: `http://localhost:5006`.
 
 ---
 

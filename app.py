@@ -1,4 +1,5 @@
 import configparser
+import gc
 import json
 import logging
 import os
@@ -19,12 +20,148 @@ app = Flask(__name__)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config_parser import load_config
+from config_parser import load_config, load_config_from_content
 from monitor import monitor
 from stream_manager import stream_manager
 
-INI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cadena_rcn.ini")
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_DIR = os.path.join(BASE_DIR, "db")
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+
+
+def list_db_configs():
+    """Devuelve [(name, full_path, size, mtime)] ordenados alfabéticamente."""
+    if not os.path.isdir(DB_DIR):
+        return []
+    out = []
+    for name in sorted(os.listdir(DB_DIR)):
+        if not name.lower().endswith(".ini"):
+            continue
+        full = os.path.join(DB_DIR, name)
+        if not os.path.isfile(full):
+            continue
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        out.append((name, full, st.st_size, int(st.st_mtime)))
+    return out
+
+
+def count_streams_in_ini(path):
+    if not path or not os.path.isfile(path):
+        return 0
+    n = 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s.startswith("[") or not s.endswith("]"):
+                    continue
+                if s[1:-1].lower() == "servidor":
+                    continue
+                n += 1
+    except OSError:
+        return 0
+    return n
+
+
+def find_db_config(name):
+    """Resuelve un nombre de config dentro de db/ con guardas de seguridad. Acepta nombres con o sin `.ini`."""
+    if not name:
+        return None
+    name = name.strip()
+    if "/" in name or "\\" in name or name.startswith("."):
+        return None
+    safe = os.path.basename(name)
+    if not safe.lower().endswith(".ini"):
+        safe = safe + ".ini"
+    return os.path.join(DB_DIR, safe)
+
+
+def resolve_active_ini_path():
+    """Resuelve el INI activo siguiendo la prioridad ASTRA_INI > config.json > primer archivo en db/ > legacy raíz."""
+    # 1) variable de entorno (override de despliegue)
+    env = (os.environ.get("ASTRA_INI") or "").strip()
+    if env:
+        return env if os.path.isabs(env) else os.path.join(BASE_DIR, env)
+    # 2) config.json > active_config
+    cfg = load_app_config()
+    stored = (cfg.get("active_config") or "").strip()
+    if stored:
+        candidate = stored if os.path.isabs(stored) else os.path.join(BASE_DIR, stored)
+        if os.path.isfile(candidate):
+            return candidate
+    # 3) primer *.ini alfabético dentro de db/
+    if os.path.isdir(DB_DIR):
+        for n in sorted(os.listdir(DB_DIR)):
+            if n.lower().endswith(".ini"):
+                full = os.path.join(DB_DIR, n)
+                if os.path.isfile(full):
+                    return full
+    # 4) legacy: cadena_rcn.ini en la raíz
+    legacy = os.path.join(BASE_DIR, "cadena_rcn.ini")
+    if os.path.isfile(legacy):
+        return legacy
+    return None
+
+
+def get_active_ini_name():
+    p = resolve_active_ini_path()
+    return os.path.basename(p) if p else None
+
+
+def migrate_root_to_db():
+    """Si existe cadena_rcn.ini en la raíz y db/ está vacío, lo mueve y persiste el activo."""
+    legacy = os.path.join(BASE_DIR, "cadena_rcn.ini")
+    if not os.path.isfile(legacy):
+        return None
+    os.makedirs(DB_DIR, exist_ok=True)
+    existing = [n for n in os.listdir(DB_DIR) if n.lower().endswith(".ini")]
+    if existing:
+        return None
+    for i in range(1, 1000):
+        target = os.path.join(DB_DIR, f"{i}_default.ini")
+        if not os.path.exists(target):
+            target_name = os.path.basename(target)
+            break
+    else:
+        return None
+    try:
+        os.replace(legacy, os.path.join(DB_DIR, target_name))
+    except OSError as e:
+        logger.warning(f"No se pudo migrar {legacy}: {e}")
+        return None
+    backup = legacy + ".bak"
+    if os.path.exists(backup):
+        try:
+            os.replace(backup, os.path.join(DB_DIR, target_name + ".bak"))
+        except OSError:
+            pass
+    cfg = load_app_config()
+    cfg["active_config"] = f"db/{target_name}"
+    try:
+        save_app_config(cfg)
+    except OSError as e:
+        logger.warning(f"No se pudo guardar active_config: {e}")
+    return target_name
+
+
+def _validate_config_name(name):
+    """Devuelve un nombre .ini saneado o None si es inválido."""
+    if not isinstance(name, str):
+        return None
+    name = name.strip()
+    if not name:
+        return None
+    if "/" in name or "\\" in name or name.startswith("."):
+        return None
+    if not name.lower().endswith(".ini"):
+        name = name + ".ini"
+    safe = os.path.basename(name)
+    if safe != name:
+        return None
+    return safe
 
 NET_INTERFACE = "enp2s0"
 _NET_LOCK = threading.Lock()
@@ -163,9 +300,10 @@ scheduler = MidnightRestartScheduler()
 
 
 def initialize_streams():
-    if not os.path.exists(INI_PATH):
+    ini_path = resolve_active_ini_path()
+    if not ini_path or not os.path.isfile(ini_path):
         return 0
-    config = load_config(INI_PATH)
+    config = load_config(ini_path)
     streams = config.get_all_streams()
     for stream_config in streams:
         name = stream_config["name"]
@@ -344,18 +482,23 @@ def restart_platform():
 
 @app.route("/api/ini/read", methods=["GET"])
 def read_ini():
-    try:
-        with open(INI_PATH, "r", encoding="utf-8") as f:
-            content = f.read()
-        return jsonify({"success": True, "content": content})
-    except FileNotFoundError:
+    ini_path = resolve_active_ini_path()
+    if not ini_path or not os.path.isfile(ini_path):
         return jsonify({"success": False, "error": "INI no encontrado"}), 404
+    try:
+        with open(ini_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return jsonify({"success": True, "content": content, "path": f"db/{os.path.basename(ini_path)}"})
     except (OSError, UnicodeDecodeError) as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/api/ini/write", methods=["POST"])
 def write_ini():
+    ini_path = resolve_active_ini_path()
+    if not ini_path:
+        return jsonify({"success": False, "error": "No hay INI activo"}), 404
+
     content = request.json.get("content", "") if request.json else ""
     if not isinstance(content, str):
         return jsonify({"success": False, "error": "content debe ser string"}), 400
@@ -363,20 +506,22 @@ def write_ini():
     if len(content) > 200_000:
         return jsonify({"success": False, "error": "INI demasiado grande"}), 400
 
-    backup_path = INI_PATH + ".bak"
+    backup_path = ini_path + ".bak"
     try:
-        with open(INI_PATH, "r", encoding="utf-8") as f:
+        with open(ini_path, "r", encoding="utf-8") as f:
             original = f.read()
     except FileNotFoundError:
         original = None
 
     try:
-        old_config = load_config(INI_PATH)
+        old_config = load_config(ini_path)
         old_streams = {s["name"]: s for s in old_config.get_all_streams()}
     except (configparser.Error, OSError, ValueError) as e:
         return jsonify({"success": False, "error": f"INI actual inválido: {e}"}), 400
 
-    fd, tmp_path = tempfile.mkstemp(prefix=".cadena_rcn-", dir=os.path.dirname(INI_PATH), suffix=".ini")
+    ini_dir = os.path.dirname(ini_path) or "."
+    os.makedirs(ini_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".astra-", dir=ini_dir, suffix=".ini")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
@@ -403,7 +548,7 @@ def write_ini():
         }), 400
 
     try:
-        os.replace(tmp_path, INI_PATH)
+        os.replace(tmp_path, ini_path)
     except OSError as e:
         try:
             os.unlink(tmp_path)
@@ -526,9 +671,179 @@ def get_errors():
     return jsonify({"errors": errors})
 
 
+# -------- Multi-config (carpeta db/) ----------------------------------------
+
+_INI_TEMPLATE = (
+    "[servidor]\n"
+    "FFMPEG_PATH=/usr/bin/ffmpeg\n"
+    "\n"
+    "[01_Ejemplo]\n"
+    "Original_URL=https://origen.example.com/stream\n"
+    "Destination_URL=rtmp://127.0.0.1:1935/live/ejemplo\n"
+    "FFMPEG_PRE_OPTIONS=-re\n"
+    "FFMPEG_POST_OPTIONS=-c copy -f flv\n"
+    "autostart=true\n"
+)
+
+
+def _config_payload(name, full, size, mtime):
+    """Convierte una entrada (name, full, size, mtime) al JSON público."""
+    active = get_active_ini_name() or ""
+    return {
+        "name": name,
+        "path": f"db/{name}",
+        "size": size,
+        "modified": mtime,
+        "active": name == active,
+        "streams": count_streams_in_ini(full),
+    }
+
+
+@app.route("/api/configs", methods=["GET"])
+def configs_list():
+    items = [_config_payload(n, full, sz, mt) for (n, full, sz, mt) in list_db_configs()]
+    active = get_active_ini_name()
+    ini_path = resolve_active_ini_path()
+    return jsonify({
+        "success": True,
+        "configs": items,
+        "active": active,
+        "active_path": ini_path,
+        "db_dir": DB_DIR,
+        "env_override": bool((os.environ.get("ASTRA_INI") or "").strip()),
+    })
+
+
+@app.route("/api/configs", methods=["POST"])
+def configs_create():
+    data = request.json or {}
+    name = _validate_config_name(data.get("name", ""))
+    if not name:
+        return jsonify({"success": False, "error": "Nombre inválido. Usa solo letras, números, guiones y la extensión .ini."}), 400
+    target = os.path.join(DB_DIR, name)
+    if os.path.isfile(target):
+        return jsonify({"success": False, "error": f"{name} ya existe"}), 409
+    content = data.get("content")
+    if content is None:
+        content = _INI_TEMPLATE
+    if not isinstance(content, str):
+        return jsonify({"success": False, "error": "content debe ser string"}), 400
+    try:
+        load_config_from_content(content).get_all_streams()  # validación de parseo
+    except (configparser.Error, ValueError) as e:
+        return jsonify({"success": False, "error": f"INI inválido: {e}"}), 400
+    os.makedirs(DB_DIR, exist_ok=True)
+    try:
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    if data.get("activate"):
+        cfg = load_app_config()
+        cfg["active_config"] = f"db/{name}"
+        try:
+            save_app_config(cfg)
+        except OSError as e:
+            return jsonify({"success": False, "error": str(e)}), 500
+    return jsonify({"success": True, "name": name, "path": f"db/{name}"})
+
+
+@app.route("/api/configs/activate", methods=["POST"])
+def configs_activate():
+    data = request.json or {}
+    target = find_db_config(data.get("name", ""))
+    if not target or not os.path.isfile(target):
+        return jsonify({"success": False, "error": "Configuración no encontrada en db/"}), 404
+    base = os.path.basename(target)
+    cfg = load_app_config()
+    cfg["active_config"] = f"db/{base}"
+    try:
+        save_app_config(cfg)
+    except OSError as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+    # stop_all + cargar + arrancar
+    with stream_manager._lock:
+        try:
+            stream_manager.stop_all_and_cleanup()
+        except Exception as e:
+            logger.warning(f"stop_all_and_cleanup: {e}")
+        # limpiar referencias al manager
+        for name in list(stream_manager.streams.keys()):
+            stream_manager.streams.pop(name, None)
+        gc.collect()
+
+    loaded = 0
+    started = 0
+    try:
+        new_config = load_config(target)
+        for s in new_config.get_all_streams():
+            stream_manager.register_stream(s["name"], s)
+            loaded += 1
+            if s.get("autostart") or START_ALL_ON_BOOT:
+                stream_manager.start_stream(s["name"])
+                time.sleep(2)
+                started += 1
+    except (configparser.Error, OSError, ValueError) as e:
+        return jsonify({"success": False, "error": f"Error cargando {base}: {e}"}), 500
+
+    return jsonify({
+        "success": True,
+        "active": base,
+        "loaded": loaded,
+        "started": started,
+    })
+
+
+@app.route("/api/configs/<path:name>", methods=["DELETE"])
+def configs_delete(name):
+    target = find_db_config(name)
+    if not target or not os.path.isfile(target):
+        return jsonify({"success": False, "error": "No encontrada"}), 404
+    active_path = resolve_active_ini_path()
+    if active_path and os.path.abspath(active_path) == os.path.abspath(target):
+        return jsonify({"success": False, "error": "No se puede borrar la configuración activa. Activa otra primero."}), 400
+    try:
+        os.unlink(target)
+        bak = target + ".bak"
+        if os.path.isfile(bak):
+            os.unlink(bak)
+    except OSError as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    return jsonify({"success": True})
+
+
 if __name__ == "__main__":
+    if "--init" in sys.argv:
+        migrated = migrate_root_to_db()
+        os.makedirs(DB_DIR, exist_ok=True)
+        existing = list_db_configs()
+        active = get_active_ini_name()
+        if migrated:
+            print(f"[init] Migrado cadena_rcn.ini → db/{migrated}")
+        elif not existing and not active:
+            template = os.path.join(BASE_DIR, "cadena_rcn.ini.example")
+            if os.path.isfile(template):
+                name = "1_local.ini"
+                target = os.path.join(DB_DIR, name)
+                with open(template, "r", encoding="utf-8") as src, open(target, "w", encoding="utf-8") as dst:
+                    dst.write(src.read())
+                cfg = load_app_config()
+                cfg["active_config"] = f"db/{name}"
+                save_app_config(cfg)
+                print(f"[init] Creado db/{name} desde cadena_rcn.ini.example")
+            else:
+                print("[init] db/ vacío y no hay cadena_rcn.ini.example. Ejecuta la UI para crear uno.")
+        else:
+            print(f"[init] db/ ya contiene {len(existing)} configuraciones, activa: {active or '(ninguna)'}")
+        sys.exit(0)
+
+    migrate_root_to_db()
     count = initialize_streams()
-    print(f"Loaded {count} streams from configuration")
+    active = get_active_ini_name() or "(ninguna)"
+    print(f"Loaded {count} streams from db/{active}")
 
     monitor.start()
     scheduler.start()

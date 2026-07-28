@@ -2,10 +2,15 @@ import configparser
 
 
 class ConfigParser:
-    def __init__(self, ini_path):
-        self.ini_path = ini_path
-        self.config = configparser.ConfigParser()
-        self.config.read(ini_path, encoding="utf-8")
+    def __init__(self, ini_path=None, content=None):
+        if content is not None:
+            self.ini_path = None
+            self.config = configparser.ConfigParser()
+            self.config.read_string(content)
+        else:
+            self.ini_path = ini_path
+            self.config = configparser.ConfigParser()
+            self.config.read(ini_path, encoding="utf-8")
 
     def get_all_streams(self):
         streams = []
@@ -50,4 +55,8 @@ class ConfigParser:
 
 
 def load_config(ini_path):
-    return ConfigParser(ini_path)
+    return ConfigParser(ini_path=ini_path)
+
+
+def load_config_from_content(content):
+    return ConfigParser(content=content)

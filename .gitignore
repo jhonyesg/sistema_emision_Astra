@@ -15,6 +15,10 @@ cadena_rcn.ini
 .env
 .env.*
 
+# Multi-deployment configs (cada .ini es propio por despliegue / cliente)
+db/*.ini
+db/*.ini.bak
+
 # Tooling state
 .claude/
 .kilo/
