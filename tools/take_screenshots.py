@@ -65,7 +65,60 @@ async def main():
         await page.locator("#streams-tbody tr .cell-actions .btn-info").first.click()
         await page.wait_for_selector("#details-modal", state="visible", timeout=5000)
         await page.locator(".tab-btn", has_text="Comando").click()
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(800)
+        # Redact the Original URL field if the open stream happens to be
+        # Telemedellín (public SRT host + passphrase). Keep all other streams
+        # untouched because they only expose LAN IPs.
+        await page.evaluate(
+            """
+            () => {
+                // 1) Original URL field (under the command box).
+                const cfg = document.getElementById('cmd-config');
+                if (cfg) {
+                    const strongs = cfg.querySelectorAll('strong');
+                    for (const s of strongs) {
+                        if (s.textContent.trim().toLowerCase().startsWith('original')) {
+                            const code = s.parentElement.querySelector('code');
+                            if (code && /midecotv\\.ddns\\.net|passphrase=/.test(code.textContent)) {
+                                code.textContent = 'srt://<dominio-p\u00fablico>:<puerto>?passphrase=**********';
+                                code.style.color = '#888';
+                                code.style.textDecoration = 'line-through';
+                                code.style.textDecorationColor = '#ff5e5e';
+                                code.style.textDecorationThickness = '2px';
+                                const badge = document.createElement('span');
+                                badge.textContent = '  [OCULTO]';
+                                badge.style.color = '#ff5e5e';
+                                badge.style.fontWeight = 'bold';
+                                badge.style.marginLeft = '8px';
+                                code.after(badge);
+                                break;
+                            }
+                        }
+                    }
+                }
+                // 2) Raw ffmpeg command box at the top of the modal.
+                const cmd = document.getElementById('cmd-content');
+                if (cmd && /midecotv\\.ddns\\.net/.test(cmd.textContent)) {
+                    const masked = cmd.textContent.replace(
+                        /srt:\\/\\/midecotv\\.ddns\\.net:\\d+\\?passphrase=[^&\\s"]+/,
+                        'srt://<dominio-p\u00fablico>:<puerto>?passphrase=**********'
+                    );
+                    cmd.textContent = masked;
+                    cmd.style.textDecoration = 'line-through';
+                    cmd.style.textDecorationColor = '#ff5e5e';
+                    cmd.style.textDecorationThickness = '2px';
+                    const badge = document.createElement('span');
+                    badge.textContent = '  [OCULTO: dominio p\u00fablico + passphrase]';
+                    badge.style.color = '#ff5e5e';
+                    badge.style.fontWeight = 'bold';
+                    badge.style.marginLeft = '12px';
+                    badge.style.fontSize = '14px';
+                    cmd.after(badge);
+                }
+            }
+            """
+        )
+        await page.wait_for_timeout(150)
         await shoot_clip(page, page.locator("#details-modal .modal-content"), "modal-details-command.png")
         await page.close()
 
