@@ -89,7 +89,74 @@ async def main():
         # INI modal
         await page.locator("button", has_text="INI").click()
         await page.wait_for_selector("#ini-modal", timeout=5000)
-        await page.wait_for_timeout(500)
+        await page.wait_for_function(
+            "document.getElementById('ini-content').value.includes('[01_Telemedellin]')",
+            timeout=5000,
+        )
+        await page.wait_for_timeout(400)
+        # Redact the Telemedellín Original_URL (public SRT host) in-place so the
+        # screenshot never shows the real domain / passphrase. The screenshot
+        # script never POSTs anything back, this only edits the DOM textarea
+        # for the documentation capture.
+        await page.evaluate(
+            """
+            () => {
+                const ta = document.getElementById('ini-content');
+                const lines = ta.value.split('\\n');
+                const idx = lines.findIndex(l => l.includes('[01_Telemedellin]'));
+                if (idx === -1) return;
+                // Replace only the long public-domain URL with a short placeholder
+                // so it fits on a single line in the screenshot.
+                lines[idx + 1] = 'Original_URL=srt://<dominio-publico-redactado>:<puerto>?passphrase=<clave-oculta>';
+                ta.value = lines.join('\\n');
+
+                const rect = ta.getBoundingClientRect();
+                const cs = getComputedStyle(ta);
+                const lineHeight = parseFloat(cs.lineHeight) || (parseFloat(cs.fontSize) * 1.4);
+                const paddingTop = parseFloat(cs.paddingTop) || 0;
+                const paddingLeft = parseFloat(cs.paddingLeft) || 0;
+                const paddingRight = parseFloat(cs.paddingRight) || 0;
+                const urlLineIdx = idx + 1;
+
+                const overlay = document.createElement('div');
+                overlay.style.cssText = `
+                    position: fixed;
+                    left: ${rect.left + paddingLeft}px;
+                    top:  ${rect.top  + paddingTop + urlLineIdx * lineHeight - 2}px;
+                    width: ${rect.width - paddingLeft - paddingRight}px;
+                    height: ${lineHeight + 4}px;
+                    background: #1f1f1f;
+                    border-left: 3px solid #ff5e5e;
+                    color: #ffb4b4;
+                    font-family: ${cs.fontFamily};
+                    font-size: ${cs.fontSize};
+                    line-height: ${lineHeight}px;
+                    padding: 0 10px;
+                    z-index: 999999;
+                    white-space: nowrap;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    pointer-events: none;
+                    box-sizing: border-box;
+                `;
+                const inner = document.createElement('span');
+                inner.textContent = '\u26D4  Original_URL = srt://<dominio-p\u00fablico>:<puerto>?passphrase=**********';
+                inner.style.textDecoration = 'line-through';
+                inner.style.textDecorationColor = '#ff5e5e';
+                inner.style.textDecorationThickness = '2px';
+                inner.style.color = '#aaaaaa';
+                overlay.appendChild(inner);
+                const tag = document.createElement('span');
+                tag.textContent = '  [OCULTO]';
+                tag.style.color = '#ff5e5e';
+                tag.style.fontWeight = 'bold';
+                tag.style.marginLeft = '8px';
+                overlay.appendChild(tag);
+                document.body.appendChild(overlay);
+            }
+            """
+        )
+        await page.wait_for_timeout(150)
         await shoot_clip(page, page.locator("#ini-modal .modal-content"), "modal-ini.png")
         await page.close()
 
