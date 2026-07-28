@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ platform_title }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="toast-container" id="toast-container"></div>
+    <div class="container">
+        <header>
+            <div class="header-left">
+                <h1 id="platform-title" contenteditable="false" spellcheck="false">📺 {{ platform_title }}</h1>
+                <span class="subtitle">Control de Streams en Vivo</span>
+            </div>
+            <div class="controls-header">
+                <a href="/help" target="_blank" class="btn btn-secondary">📖 Docs</a>
+                <button class="btn btn-secondary" onclick="showErrors()">📊 Errores</button>
+                <button class="btn btn-secondary" onclick="editIni()">📝 INI</button>
+                <button class="btn btn-secondary" onclick="editTitle()" title="Editar título">✏️ Título</button>
+                <button id="btn-start-all" class="btn btn-success" onclick="startAll()">▶</button>
+                <button id="btn-stop-all" class="btn btn-danger" onclick="stopAll()">■</button>
+                <button id="btn-restart-platform" class="btn btn-warning" onclick="restartPlatform()" title="Reiniciar toda la plataforma">↻</button>
+            </div>
+        </header>
+
+        <div class="status-bar">
+            <div class="status-item">
+                <span class="status-label">Activas</span>
+                <span id="running-count" class="status-value success">0</span>
+            </div>
+            <div class="status-divider"></div>
+            <div class="status-item">
+                <span class="status-label">Detenidas</span>
+                <span id="stopped-count" class="status-value muted">0</span>
+            </div>
+            <div class="status-divider"></div>
+            <div class="status-item">
+                <span class="status-label">Total</span>
+                <span id="total-count" class="status-value">0</span>
+            </div>
+            <div class="status-divider"></div>
+            <div class="status-item">
+                <span class="status-label">CPU</span>
+                <span id="cpu-usage" class="status-value">-</span>
+            </div>
+            <div class="status-divider"></div>
+            <div class="status-item">
+                <span class="status-label">RAM</span>
+                <span id="ram-usage" class="status-value">-</span>
+            </div>
+            <div class="status-divider"></div>
+            <div class="status-item">
+                <span id="net-label" class="status-label">Red</span>
+                <span id="net-usage" class="status-value">-</span>
+            </div>
+            <div class="status-message">
+                <span id="system-message" class="system-message"></span>
+            </div>
+        </div>
+
+        <div class="toolbar">
+            <div class="search-box">
+                <span class="search-icon">🔍</span>
+                <input type="text" id="search-input" placeholder="Buscar..." oninput="filterTable()">
+            </div>
+            <div class="toolbar-toggles">
+                <div class="toggle-container">
+                    <label class="toggle">
+                        <input type="checkbox" id="auto-start-toggle" onchange="toggleAutoStart()">
+                        <span class="toggle-slider"></span>
+                    </label>
+                    <span class="toggle-label">Auto-inicio</span>
+                </div>
+                <div class="toggle-container">
+                    <label class="toggle">
+                        <input type="checkbox" id="auto-restart-toggle" onchange="toggleAutoRestart()">
+                        <span class="toggle-slider"></span>
+                    </label>
+                    <span class="toggle-label">Auto-reinicio</span>
+                </div>
+                <div class="toggle-container">
+                    <label class="toggle">
+                        <input type="checkbox" id="midnight-toggle" onchange="toggleMidnightRestart()">
+                        <span class="toggle-slider"></span>
+                    </label>
+                    <span class="toggle-label">Reinicio medianoche</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="table-container">
+            <table class="streams-table" id="streams-table">
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th class="sortable" data-sort="status">Estado <span class="sort-icon">&#8693;</span></th>
+                        <th class="sortable" data-sort="name">Stream <span class="sort-icon">&#8693;</span></th>
+                        <th class="sortable" data-sort="pid">PID <span class="sort-icon">&#8693;</span></th>
+                        <th class="sortable" data-sort="bitrate">Bitrate <span class="sort-icon">&#8693;</span></th>
+                        <th class="sortable" data-sort="size">Tama&ntilde;o <span class="sort-icon">&#8693;</span></th>
+                        <th class="sortable" data-sort="speed">Velocidad <span class="sort-icon">&#8693;</span></th>
+                        <th class="sortable" data-sort="uptime">Uptime <span class="sort-icon">&#8693;</span></th>
+                        <th class="sortable" data-sort="restarts">RST <span class="sort-icon">&#8693;</span></th>
+                        <th>Acciones</th>
+                    </tr>
+                </thead>
+                <tbody id="streams-tbody">
+                </tbody>
+            </table>
+        </div>
+
+        <footer>
+            <span>Actualizando cada 2s</span>
+            <span class="separator">|</span>
+            <span>-re por defecto</span>
+        </footer>
+    </div>
+
+    <div id="ini-modal" class="modal">
+        <div class="modal-content modal-xl">
+            <div class="modal-header">
+                <h2>📝 Editar cadena_rcn.ini</h2>
+                <button class="modal-close" onclick="closeIniModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="ini-controls">
+                    <button class="btn btn-sm btn-primary" onclick="saveIni()">💾 Guardar</button>
+                    <button class="btn btn-sm" onclick="loadIni()">↻</button>
+                    <span id="ini-status" class="ini-status"></span>
+                </div>
+                <textarea id="ini-content" class="ini-content" spellcheck="false"></textarea>
+                <p class="ini-warning">⚠️ Solo se reinician los streams modificados</p>
+            </div>
+        </div>
+    </div>
+
+    <div id="details-modal" class="modal">
+        <div class="modal-content modal-lg">
+            <div class="modal-header">
+                <h2 id="details-modal-title">Detalles</h2>
+                <button class="modal-close" onclick="closeDetailsModal()">&times;</button>
+            </div>
+            <div class="tabs">
+                <button class="tab-btn active" onclick="switchTab('logs')">📋 Logs</button>
+                <button class="tab-btn" onclick="switchTab('command')">⚙ Comando</button>
+            </div>
+            <div class="modal-body">
+                <div id="tab-logs" class="tab-content">
+                    <div class="log-controls">
+                        <button class="btn btn-sm" onclick="refreshLogs()">↻</button>
+                        <button class="btn btn-sm btn-danger" onclick="clearDisplay()">Limpiar</button>
+                    </div>
+                    <pre id="log-content" class="log-content"></pre>
+                </div>
+                <div id="tab-command" class="tab-content" style="display:none;">
+                    <div class="cmd-controls">
+                        <button class="btn btn-sm btn-copy" onclick="copyCommand()">📋 Copiar</button>
+                    </div>
+                    <pre id="cmd-content" class="cmd-content"></pre>
+                    <div id="cmd-config" class="cmd-config"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="errors-modal" class="modal">
+        <div class="modal-content modal-lg">
+            <div class="modal-header">
+                <h2>📊 Historial de Reinicios/Errores</h2>
+                <button class="modal-close" onclick="closeErrorsModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="errors-content"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = '/api';
+        const POLL_INTERVAL = 2000;
+        let streamsData = {};
+        let currentLogStream = null;
+        let currentCmdStream = null;
+        let currentCommand = null;
+        let sortColumn = 'name';
+        let sortDirection = 'asc';
+        let searchTerm = '';
+        let rowNumber = 0;
+
+        async function fetchStatus() {
+            try {
+                const response = await fetch(`${API_BASE}/status`);
+                const data = await response.json();
+                streamsData = data.streams;
+                updateUI(data);
+            } catch (error) {
+                console.error('Error fetching status:', error);
+            }
+        }
+
+        async function fetchConfig() {
+            try {
+                const response = await fetch(`${API_BASE}/config`);
+                const data = await response.json();
+                document.getElementById('auto-start-toggle').checked = data.start_all_on_boot;
+                document.getElementById('auto-restart-toggle').checked = data.auto_restart;
+                document.getElementById('midnight-toggle').checked = data.midnight_restart;
+                if (data.platform_title) {
+                    document.getElementById('platform-title').textContent = '📺 ' + data.platform_title;
+                    document.title = data.platform_title;
+                }
+            } catch (error) {
+                console.error('Error fetching config:', error);
+            }
+        }
+
+        function editTitle() {
+            const titleEl = document.getElementById('platform-title');
+            const current = titleEl.textContent.replace(/^📺\s*/, '');
+            const newName = prompt('Nombre de la plataforma:', current);
+            if (newName === null) return;
+            const trimmed = newName.trim();
+            if (!trimmed || trimmed === current) return;
+            saveTitle(trimmed);
+        }
+
+        async function saveTitle(title) {
+            try {
+                const res = await fetch(`${API_BASE}/config`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({platform_title: title})
+                });
+                const data = await res.json();
+                if (data.success) {
+                    document.getElementById('platform-title').textContent = '📺 ' + data.platform_title;
+                    document.title = data.platform_title;
+                    showToast('Título actualizado', 'success');
+                } else {
+                    showToast('Error al guardar título', 'error');
+                }
+            } catch { showToast('Error de conexión', 'error'); }
+        }
+
+        function updateUI(data) {
+            document.getElementById('running-count').textContent = data.summary.running;
+            document.getElementById('stopped-count').textContent = data.summary.stopped;
+            document.getElementById('total-count').textContent = data.summary.total;
+
+            if (data.system) {
+                document.getElementById('cpu-usage').textContent = data.system.cpu_percent.toFixed(1) + '%';
+                document.getElementById('ram-usage').textContent = data.system.mem_percent.toFixed(1) + '%';
+                document.getElementById('net-label').textContent = `Red (${data.system.net_interface})`;
+                document.getElementById('net-usage').textContent =
+                    `↑${data.system.upload_mbps.toFixed(1)} ↓${data.system.download_mbps.toFixed(1)} Mbps`;
+            }
+
+            const systemMessage = document.getElementById('system-message');
+            const btnStartAll = document.getElementById('btn-start-all');
+            const btnStopAll = document.getElementById('btn-stop-all');
+
+            if (data.summary.all_running) {
+                systemMessage.textContent = '● 100% operacional';
+                systemMessage.className = 'system-message status-ok';
+            } else if (data.summary.running > 0) {
+                systemMessage.textContent = '● ' + data.summary.stopped + ' detenido(s)';
+                systemMessage.className = 'system-message status-warning';
+            } else {
+                systemMessage.textContent = '● Sin actividad';
+                systemMessage.className = 'system-message status-error';
+            }
+
+            btnStartAll.disabled = data.summary.running === data.summary.total;
+            btnStopAll.disabled = data.summary.running === 0;
+
+            renderTable();
+        }
+
+        function filterTable() {
+            searchTerm = document.getElementById('search-input').value.toLowerCase();
+            renderTable();
+        }
+
+        function renderTable() {
+            const tbody = document.getElementById('streams-tbody');
+            tbody.innerHTML = '';
+
+            const entries = Object.entries(streamsData);
+            
+            const filtered = entries.filter(([name]) => name.toLowerCase().includes(searchTerm));
+
+            if (filtered.length === 0) {
+                const tr = document.createElement('tr');
+                tr.innerHTML = '<td colspan="10" class="table-empty">No se encontraron streams</td>';
+                tbody.appendChild(tr);
+                return;
+            }
+
+            const sorted = filtered.sort((a, b) => {
+                let valA, valB;
+                switch(sortColumn) {
+                    case 'status': valA = a[1].status; valB = b[1].status; break;
+                    case 'name': valA = a[0].toLowerCase(); valB = b[0].toLowerCase(); break;
+                    case 'pid': valA = a[1].pid || 0; valB = b[1].pid || 0; break;
+                    case 'bitrate': valA = parseFloat(a[1].bitrate) || 0; valB = parseFloat(b[1].bitrate) || 0; break;
+                    case 'size': valA = a[1].file_size || ''; valB = b[1].file_size || ''; break;
+                    case 'speed': valA = a[1].speed || ''; valB = b[1].speed || ''; break;
+                    case 'uptime': valA = a[1].uptime || 0; valB = b[1].uptime || 0; break;
+                    case 'restarts': valA = a[1].restart_count || 0; valB = b[1].restart_count || 0; break;
+                    default: valA = a[0]; valB = b[0];
+                }
+                if (typeof valA === 'string') {
+                    return sortDirection === 'asc' ? valA.localeCompare(valB) : valB.localeCompare(valA);
+                }
+                return sortDirection === 'asc' ? valA - valB : valB - valA;
+            });
+
+            rowNumber = 0;
+            for (const [name, stream] of sorted) {
+                rowNumber++;
+                const tr = createStreamRow(name, stream, rowNumber);
+                tbody.appendChild(tr);
+            }
+        }
+
+        function setupSortHandlers() {
+            document.querySelectorAll('th.sortable').forEach(th => {
+                th.addEventListener('click', () => {
+                    const column = th.dataset.sort;
+                    if (sortColumn === column) {
+                        sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
+                    } else {
+                        sortColumn = column;
+                        sortDirection = 'asc';
+                    }
+                    document.querySelectorAll('th.sortable').forEach(h => {
+                        h.classList.remove('sort-asc', 'sort-desc');
+                        const icon = h.querySelector('.sort-icon');
+                        if (icon) icon.innerHTML = '&#8693;';
+                    });
+                    th.classList.add(sortDirection === 'asc' ? 'sort-asc' : 'sort-desc');
+                    const icon = th.querySelector('.sort-icon');
+                    if (icon) icon.innerHTML = sortDirection === 'asc' ? '&#8593;' : '&#8595;';
+                    renderTable();
+                });
+            });
+        }
+
+        function createStreamRow(name, stream, num) {
+            const tr = document.createElement('tr');
+            tr.className = `row-${stream.status}`;
+
+            const statusText = {'running': 'Emitiendo', 'stopped': 'Detenido', 'starting': 'Iniciando', 'error': 'Error', 'restarting': 'Reiniciando'};
+
+            tr.innerHTML = `
+                <td class="cell-number">${num}</td>
+                <td class="cell-status">
+                    <span class="status-dot ${stream.status}"></span>
+                    <span class="status-text">${statusText[stream.status] || stream.status}</span>
+                </td>
+                <td class="cell-name">${escapeHtml(name)}</td>
+                <td class="cell-pid">${stream.pid || '-'}</td>
+                <td class="cell-bitrate">${stream.bitrate || '-'}</td>
+                <td class="cell-size">${stream.file_size || '-'}</td>
+                <td class="cell-speed">${stream.speed || '-'}</td>
+                <td class="cell-uptime">${formatUptime(stream.uptime)}</td>
+                <td class="cell-restarts">${stream.restart_count}</td>
+                <td class="cell-actions">
+                    <button class="btn btn-xs btn-success" onclick="startStream('${escapeHtml(name)}')" ${stream.status === 'running' ? 'disabled' : ''}>▶</button>
+                    <button class="btn btn-xs btn-danger" onclick="stopStream('${escapeHtml(name)}')" ${stream.status !== 'running' ? 'disabled' : ''}>■</button>
+                    <button class="btn btn-xs btn-warning" onclick="restartStream('${escapeHtml(name)}')">↻</button>
+                    <button class="btn btn-xs btn-info" onclick="showDetails('${escapeHtml(name)}')" title="Logs y Comando">📋</button>
+                </td>
+            `;
+            return tr;
+        }
+
+        function showToast(message, type = 'info', duration = 3000) {
+            const container = document.getElementById('toast-container');
+            const icons = { success: '\u2713', error: '\u2717', warning: '\u26A0', info: '\u2139' };
+            const toast = document.createElement('div');
+            toast.className = `toast toast-${type}`;
+            toast.innerHTML = `<span class="toast-icon">${icons[type] || icons.info}</span><span class="toast-message">${message}</span><button class="toast-close" onclick="this.parentElement.classList.add('toast-out');setTimeout(()=>this.parentElement.remove(),300)">&times;</button>`;
+            container.appendChild(toast);
+            setTimeout(() => {
+                if (toast.parentElement) {
+                    toast.classList.add('toast-out');
+                    setTimeout(() => toast.remove(), 300);
+                }
+            }, duration);
+        }
+
+        async function startStream(name) {
+            try {
+                const res = await fetch(`${API_BASE}/stream/${encodeURIComponent(name)}/start`, { method: 'POST' });
+                const data = await res.json();
+                if (data.success) showToast(`${name}: iniciado`, 'success');
+                else showToast(`${name}: error al iniciar`, 'error');
+            } catch { showToast(`${name}: error de conexi\u00f3n`, 'error'); }
+            fetchStatus();
+        }
+
+        async function stopStream(name) {
+            try {
+                const res = await fetch(`${API_BASE}/stream/${encodeURIComponent(name)}/stop`, { method: 'POST' });
+                const data = await res.json();
+                if (data.success) showToast(`${name}: detenido`, 'success');
+                else showToast(`${name}: error al detener`, 'error');
+            } catch { showToast(`${name}: error de conexi\u00f3n`, 'error'); }
+            fetchStatus();
+        }
+
+        async function restartStream(name) {
+            try {
+                const res = await fetch(`${API_BASE}/stream/${encodeURIComponent(name)}/restart`, { method: 'POST' });
+                const data = await res.json();
+                if (data.success) showToast(`${name}: reiniciado`, 'success');
+                else showToast(`${name}: error al reiniciar`, 'error');
+            } catch { showToast(`${name}: error de conexi\u00f3n`, 'error'); }
+            fetchStatus();
+        }
+
+        async function startAll() {
+            try {
+                await fetch(`${API_BASE}/start_all`, { method: 'POST' });
+                showToast('Todos los streams iniciados', 'success');
+            } catch { showToast('Error al iniciar streams', 'error'); }
+            fetchStatus();
+        }
+
+        async function stopAll() {
+            try {
+                await fetch(`${API_BASE}/stop_all`, { method: 'POST' });
+                showToast('Todos los streams detenidos', 'success');
+            } catch { showToast('Error al detener streams', 'error'); }
+            fetchStatus();
+        }
+
+        async function restartPlatform() {
+            if (!confirm('¿Reiniciar toda la plataforma?\nEsto detiene todos los streams y reinicia el servicio (puerto 5006).')) return;
+            const btn = document.getElementById('btn-restart-platform');
+            btn.disabled = true;
+            btn.textContent = '...';
+            document.getElementById('system-message').textContent = '● Reiniciando plataforma...';
+            document.getElementById('system-message').className = 'system-message status-warning';
+            showToast('Reiniciando plataforma...', 'warning', 8000);
+
+            try { await fetch(`${API_BASE}/restart_platform`, { method: 'POST' }); } catch {}
+
+            let waited = 0;
+            const checkReconnect = setInterval(async () => {
+                waited += 2;
+                try {
+                    const response = await fetch(`${API_BASE}/status`);
+                    if (response.ok) {
+                        clearInterval(checkReconnect);
+                        btn.disabled = false;
+                        btn.textContent = '↻';
+                        showToast('Plataforma reiniciada correctamente', 'success');
+                        fetchStatus();
+                    }
+                } catch {
+                    document.getElementById('system-message').textContent = `● Esperando servicio... ${waited}s`;
+                }
+                if (waited >= 30) {
+                    clearInterval(checkReconnect);
+                    btn.disabled = false;
+                    btn.textContent = '↻';
+                    showToast('El servicio tardó en responder. Verifique manualmente.', 'warning');
+                }
+            }, 2000);
+        }
+
+        async function toggleAutoStart() {
+            const enabled = document.getElementById('auto-start-toggle').checked;
+            await fetch(`${API_BASE}/config`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({start_all_on_boot: enabled})
+            });
+        }
+
+        async function toggleAutoRestart() {
+            const enabled = document.getElementById('auto-restart-toggle').checked;
+            await fetch(`${API_BASE}/config`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({auto_restart: enabled})
+            });
+        }
+
+        async function toggleMidnightRestart() {
+            const enabled = document.getElementById('midnight-toggle').checked;
+            await fetch(`${API_BASE}/config`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({midnight_restart: enabled})
+            });
+        }
+
+        async function showDetails(name) {
+            currentLogStream = name;
+            currentCmdStream = name;
+            document.getElementById('details-modal-title').textContent = `Detalles: ${name}`;
+            document.getElementById('details-modal').style.display = 'flex';
+            switchTab('logs');
+            await refreshLogs();
+            await loadCommand(name);
+            if (!window.logRefreshInterval) {
+                window.logRefreshInterval = setInterval(refreshLogs, 2000);
+            }
+        }
+
+        async function loadCommand(name) {
+            try {
+                const response = await fetch(`${API_BASE}/stream/${encodeURIComponent(name)}/command`);
+                const data = await response.json();
+                currentCommand = data.command;
+                document.getElementById('cmd-content').textContent = data.command;
+                document.getElementById('cmd-config').innerHTML = '<div class="config-grid"><div><strong>Original:</strong><code>' + escapeHtml(data.config.original_url) + '</code></div><div><strong>Destino:</strong><code>' + escapeHtml(data.config.destination_url) + '</code></div><div><strong>PRE:</strong><code>' + escapeHtml(data.config.ffmpeg_pre_options || '-') + '</code></div><div><strong>POST:</strong><code>' + escapeHtml(data.config.ffmpeg_post_options || '-') + '</code></div></div>';
+            } catch (error) { console.error('Error:', error); }
+        }
+
+        function switchTab(tab) {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.style.display = 'none');
+            if (tab === 'logs') {
+                document.querySelector('.tab-btn:nth-child(1)').classList.add('active');
+                document.getElementById('tab-logs').style.display = 'block';
+            } else {
+                document.querySelector('.tab-btn:nth-child(2)').classList.add('active');
+                document.getElementById('tab-command').style.display = 'block';
+            }
+        }
+
+        async function showErrors() {
+            try {
+                const response = await fetch(`${API_BASE}/errors`);
+                const data = await response.json();
+                const container = document.getElementById('errors-content');
+                if (data.errors && data.errors.length > 0) {
+                    let html = '<table class="errors-table"><thead><tr><th>#</th><th>Fecha</th><th>Stream</th><th>Tipo</th><th>Detalle</th></tr></thead><tbody>';
+                    data.errors.forEach((err, i) => {
+                        html += `<tr>
+                            <td>${i + 1}</td>
+                            <td>${err.timestamp}</td>
+                            <td>${escapeHtml(err.stream)}</td>
+                            <td><span class="error-type ${err.type}">${err.type === 'restart' ? 'Reinicio' : 'Error'}</span></td>
+                            <td><pre class="error-detail">${escapeHtml(err.message)}</pre></td>
+                        </tr>`;
+                    });
+                    html += '</tbody></table>';
+                    container.innerHTML = html;
+                } else {
+                    container.innerHTML = '<p class="text-muted">Sin errores registrados</p>';
+                }
+                document.getElementById('errors-modal').style.display = 'flex';
+            } catch (error) { console.error('Error:', error); }
+        }
+
+        async function refreshLogs() {
+            if (!currentLogStream) return;
+            try {
+                const response = await fetch(`${API_BASE}/logs/${encodeURIComponent(currentLogStream)}?lines=200`);
+                const data = await response.json();
+                const logContent = document.getElementById('log-content');
+                logContent.textContent = data.logs.join('\n');
+                logContent.scrollTop = logContent.scrollHeight;
+            } catch (error) { console.error('Error:', error); }
+        }
+
+        function copyCommand() {
+            if (currentCommand) navigator.clipboard.writeText(currentCommand);
+        }
+
+        function closeDetailsModal() {
+            document.getElementById('details-modal').style.display = 'none';
+            currentLogStream = null;
+            currentCmdStream = null;
+            currentCommand = null;
+            if (window.logRefreshInterval) { clearInterval(window.logRefreshInterval); window.logRefreshInterval = null; }
+        }
+
+        function closeErrorsModal() {
+            document.getElementById('errors-modal').style.display = 'none';
+        }
+
+        function clearDisplay() { document.getElementById('log-content').textContent = ''; }
+
+        async function editIni() {
+            document.getElementById('ini-modal').style.display = 'flex';
+            await loadIni();
+        }
+
+        async function loadIni() {
+            try {
+                const response = await fetch(`${API_BASE}/ini/read`);
+                const data = await response.json();
+                if (data.success) {
+                    document.getElementById('ini-content').value = data.content;
+                    document.getElementById('ini-status').textContent = '✓';
+                } else {
+                    document.getElementById('ini-status').textContent = '✗ ' + data.error;
+                }
+            } catch (error) { console.error('Error:', error); }
+        }
+
+        async function saveIni() {
+            const content = document.getElementById('ini-content').value;
+            const statusEl = document.getElementById('ini-status');
+            statusEl.textContent = 'Guardando...';
+            try {
+                const response = await fetch(`${API_BASE}/ini/write`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({content})
+                });
+                const data = await response.json();
+                if (data.success) {
+                    let msg = [];
+                    if (data.added && data.added.length) msg.push(`+${data.added.length}`);
+                    if (data.changed && data.changed.length) msg.push(`~${data.changed.length}`);
+                    if (data.removed && data.removed.length) msg.push(`-${data.removed.length}`);
+                    const total = (data.added?.length || 0) + (data.changed?.length || 0) + (data.removed?.length || 0);
+                    statusEl.textContent = total > 0 ? `✓ ${msg.join(' ')}` : '✓ Sin cambios';
+                    setTimeout(() => fetchStatus(), 1000);
+                } else { statusEl.textContent = '✗ ' + data.error; }
+            } catch (error) { statusEl.textContent = '✗ Error'; }
+        }
+
+        function closeIniModal() { document.getElementById('ini-modal').style.display = 'none'; }
+
+        function formatUptime(seconds) {
+            if (seconds === 0) return '-';
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = seconds % 60;
+            if (h > 0) return `${h}h ${m}m`;
+            if (m > 0) return `${m}m ${s}s`;
+            return `${s}s`;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') { closeIniModal(); closeDetailsModal(); closeErrorsModal(); }
+        });
+
+        setupSortHandlers();
+        fetchConfig();
+        fetchStatus();
+        setInterval(fetchStatus, POLL_INTERVAL);
+    </script>
+</body>
+</html>

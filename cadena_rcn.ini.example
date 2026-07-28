@@ -1,0 +1,21 @@
+; Astra RTMP - Plantilla de configuracion
+;
+; Copia este archivo como `cadena_rcn.ini` y rellena los valores reales
+; de cada canal. NO commitees `cadena_rcn.ini` al repositorio.
+
+[servidor]
+FFMPEG_PATH=/usr/bin/ffmpeg
+
+[01_Telemedellin]
+Original_URL=srt://your.ddns.host:1015?passphrase=YOUR_PASSPHRASE&latency=4000000&peerlatency=4000000&mode=caller&transtype=live&payload_size=1316&tsbpd=1&tlpktdrop=1&nakreport=1&connect_timeout=10000&recv_buffer_size=8388608&send_buffer_size=8388608
+Destination_URL=rtmp://127.0.0.1:1935/live/telemedellin
+VAAPI_DRIVER=i965
+FFMPEG_PRE_OPTIONS=-timeout 15000000 -thread_queue_size 16384 -fflags +discardcorrupt+flush_packets+nobuffer -err_detect ignore_err -analyzeduration 10000000 -probesize 10000000
+FFMPEG_POST_OPTIONS=-vf scale=720:408 -r 30 -c:v libx264 -preset veryfast -tune zerolatency -b:v 1000k -maxrate 1100k -bufsize 4000k -g 60 -bf 0 -c:a aac -b:a 128k -ar 44100 -ac 2 -muxdelay 0 -muxpreload 0 -f flv
+
+[02_HTTP_Stream]
+Original_URL=http://192.168.1.10:8000/play/STREAM_ID
+Destination_URL=rtmp://127.0.0.1:1935/live/channel_key
+VAAPI_DRIVER=i965
+FFMPEG_PRE_OPTIONS=-vaapi_device /dev/dri/renderD128 -timeout 10000000 -thread_queue_size 8192 -fflags +discardcorrupt+flush_packets -err_detect ignore_err -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -analyzeduration 5000000 -probesize 5000000
+FFMPEG_POST_OPTIONS=-vf format=nv12,hwupload,scale_vaapi=720:408 -r 30 -c:v h264_vaapi -b:v 1000k -maxrate 1100k -bufsize 2000k -g 60 -bf 0 -c:a aac -b:a 128k -ar 44100 -ac 2 -muxdelay 0 -muxpreload 0 -f flv

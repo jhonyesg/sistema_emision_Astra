@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ruff_cache/
+.pytest_cache/
+.venv/
+venv/
+
+# Secrets / runtime config
+config.json
+cadena_rcn.ini
+*.bak
+*.bak.*
+*~
+.env
+.env.*
+
+# Tooling state
+.claude/
+.kilo/
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
