@@ -70,7 +70,7 @@ Al abrir `http://localhost:5006` se ve este panel principal. No tiene contraseñ
 |---|---|---|
 | **📖 Docs** | `📖` | Abre esta documentación renderizada en otra pestaña (`/help`). |
 | **📊 Errores** | `📊` | Modal con los últimos 5 reinicios automáticos y errores detectados. |
-| **📝 INI** | `📝` | Abre el editor en vivo del archivo `cadena_rcn.ini`. Al guardar se aplica **solo** a los streams modificados (los demás no se reinician). |
+| **📝 INI** | `📝` | Abre el editor en vivo del INI activo (`db/<active>.ini`). Al guardar se aplica **solo** a los streams modificados (los demás no se reinician). |
 | **✏️ Título** | `✏️` | Cambia el nombre que aparece arriba y en la pestaña del navegador. Se guarda en `config.json`. |
 | **▶** | verde | **Inicia todos** los streams registrados (`/api/start_all`). |
 | **■** | rojo | **Detiene todos** los streams (`/api/stop_all`). |
@@ -104,7 +104,7 @@ Columnas (todas ordenables clicando el header):
 |---|---|
 | **#** | Número de fila. |
 | **Estado** | ● Emitiendo (verde) / ● Iniciando (amarillo) / ● Detenido (gris) / ● Error (rojo) / ● Reiniciando (amarillo). |
-| **Stream** | Nombre de la sección en `cadena_rcn.ini`. |
+| **Stream** | Nombre de la sección en el INI activo (`db/<active>.ini`). |
 | **PID** | PID del proceso `ffmpeg` (o `-` si está detenido). |
 | **Bitrate** | Tasa de salida actual (kbits/s). |
 | **Tamaño** | Bytes escritos por ffmpeg hasta el momento. |
@@ -149,7 +149,7 @@ Edita el **INI activo** (`db/<active>.ini`). El título del modal muestra el arc
 
 ![Cabecera con selector](docs/images/dashboard-header.png)
 
-Lista todos los `db/*.ini` y muestra con ★ la activa. Al elegir otra, hace `stop_all`, recarga el INI y arranca los streams marcados con `autostart=true` (o todos si `start_all_on_boot=true`). Devuelve `{active, loaded, started}` igual que el guardado de INI.
+Lista todos los `db/*.ini` y muestra con ★ la activa. Al elegir otra, hace `stop_all`, recarga el INI, aplica los overrides del bloque `[servidor]` (ver más abajo) y arranca los streams marcados con `autostart=true` (o todos si `start_all_on_boot=true`). Devuelve `{active, loaded, started, platform_title, network}`.
 
 ### Crear nueva configuración (➕ Nuevo INI)
 
@@ -179,10 +179,10 @@ Tabla con los últimos 5 reinicios automáticos: timestamp, nombre del stream, t
 │   (cpu/ram/net)       │                      │                      │
 └───────────────────────┼──────────────────────┼──────────────────────┘
                         │                      │
-          ┌─────────────┴──────────┐   ┌────────┴────────┐
-          │   StreamManager        │   │  config.json    │
-          │   (Singleton)          │   │  (persistencia) │
-          │   + Lock global        │   └─────────────────┘
+          ┌─────────────┴──────────┐   ┌────────┴────────────────┐
+          │   StreamManager        │   │  db/<active>.ini        │
+          │   (Singleton)          │   │  + bloque [servidor]    │
+          │   + Lock global        │   │  + config.json (legacy) │
           └─────────────┬──────────┘
                         │
           ┌─────────────┴─────────────────────────────────┐
@@ -224,9 +224,9 @@ El campo `status` puede valer:
 
 ## Actualización parcial del INI
 
-Cuando se guarda el archivo `cadena_rcn.ini` desde la UI (`POST /api/ini/write`):
+Cuando se guarda el archivo `db/<active>.ini` desde la UI (`POST /api/ini/write`):
 
-1. Se hace una copia del contenido anterior en `cadena_rcn.ini.bak`.
+1. Se hace una copia del contenido anterior en `db/<active>.ini.bak`.
 2. Se valida el contenido nuevo en un archivo temporal (escritura atómica `tmp + fsync + rename`).
 3. Se compara la configuración anterior con la nueva.
 4. Solo se afectan los streams que cambiaron:
@@ -327,10 +327,11 @@ sistema_emision_Astra/
 ├── db/                     # Configuraciones de despliegue (una por .ini, NO se commitean)
 │   ├── .gitkeep
 │   ├── README.md
-│   └── 1_default.ini
+│   ├── 1_default.ini       # Canales 01–10 (LAN 127.0.0.1:8000)
+│   └── 2_playlist.ini      # Canales 11–N (playlist 192.168.0.8:8000)
 ├── cadena_rcn.ini.example  # Plantilla sanitizada para el repo (usada por --init)
 ├── config.json             # Persistencia de toggles + platform_title + active_config (NO se commitea)
-├── emisor_v1.sh            # Launcher con título personalizado para terminal
+├── emisor_v1.sh            # Launcher con título personalizado + exporta ASTRA_INI
 ├── restart_platform.sh     # Script de reinicio completo del servicio
 ├── requirements.txt        # flask, psutil, markdown
 ├── requirements-dev.txt    # playwright (sólo para regenerar capturas)
@@ -380,8 +381,9 @@ Acceso: `http://localhost:5006`.
 | POST | `/api/start_all` | Iniciar todos los streams. |
 | POST | `/api/stop_all` | Detener todos los streams. |
 | POST | `/api/restart_platform` | Detener streams, lanzar `restart_platform.sh` y `os._exit(0)`. |
-| GET | `/api/config` | Obtener toggles + `platform_title`. |
+| GET | `/api/config` | Obtener toggles + `platform_title` + `network` (interfaz de red activa). |
 | POST | `/api/config` | Guardar toggles y/o `platform_title`. |
+| POST | `/api/config/activate` | Cambiar el INI activo: para streams, recarga, aplica overrides del bloque `[servidor]` y devuelve `{active, loaded, started, platform_title, network}`. |
 | GET | `/api/ini/read` | Leer archivo INI. |
 | POST | `/api/ini/write` | Guardar INI (validación + backup + actualización parcial). |
 | GET | `/api/errors` | Historial de últimos 5 reinicios / errores. |
@@ -427,6 +429,44 @@ autostart=true
 
 ---
 
+## Overrides por despliegue: bloque `[servidor]`
+
+Además de los toggles en `config.json`, cada INI de `db/` puede llevar un bloque opcional `[servidor]` con ajustes que aplican **sólo a ese despliegue**. Esto evita editar `config.json` a mano cuando una misma máquina corre configs distintas para clientes distintos.
+
+```ini
+[servidor]
+Title=Astra RTMP - Telemedellín
+Network=enp2s0
+Night_Restart=true
+Auto_Restart=true
+Start_All_On_Boot=true
+```
+
+| Clave INI | Tipo | Default si falta | Efecto |
+|---|---|---|---|
+| `Title` | string | valor de `config.json > platform_title` | Nombre de la plataforma en el `<h1>` y la pestaña del navegador. |
+| `Network` | string | `enp2s0` | Interfaz de red que se monitoriza en la barra de estado (Mbps ↑/↓). |
+| `Night_Restart` | bool | `config.json > midnight_restart` | Activa/desactiva el `full_restart` entre 00:00 y 00:05. |
+| `Auto_Restart` | bool | `config.json > auto_restart` | Activa/desactiva el monitor de freeze / crash. |
+| `Start_All_On_Boot` | bool | `config.json > start_all_on_boot` | Arranca los streams al levantar la app aunque no tengan `autostart=true`. |
+
+**Precedencia** (de mayor a menor):
+
+1. Claves presentes en `[servidor]` del INI activo.
+2. Valores guardados en `config.json`.
+3. Constantes hardcodeadas (`enp2s0`, `true`, etc.).
+
+Los overrides se releen en dos momentos:
+
+- **Al arrancar la app** (`_apply_deployment_overrides()` en `app.py`).
+- **Al cambiar de INI activo** (`POST /api/config/activate`).
+
+Tras aplicar los overrides, las métricas de red se reinicializan contra la nueva interfaz para no arrastrar lecturas anteriores.
+
+`cadena_rcn.ini.example` incluye una sección `[servidor]` mínima como punto de partida; los INI reales de `db/` pueden ampliarla.
+
+---
+
 ## Métricas de sistema (`get_system_stats`)
 
 Se exponen en `/api/status > system` y se muestran en la barra de estado superior.
@@ -435,7 +475,7 @@ Se exponen en `/api/status > system` y se muestran en la barra de estado superio
 |---|---|
 | `cpu_percent` | `psutil.cpu_percent(interval=None)` |
 | `mem_percent` | `psutil.virtual_memory().percent` |
-| `net_interface` | `enp2s0` (constante `NET_INTERFACE` en `app.py`) |
+| `net_interface` | `enp2s0` por defecto; sobreescribible desde `[servidor] Network=` del INI activo |
 | `upload_mbps`   | Δ `bytes_sent` × 8 / Δt / 1e6 |
 | `download_mbps` | Δ `bytes_recv` × 8 / Δt / 1e6 |
 
@@ -552,7 +592,7 @@ Botón **📝 INI** en la UI → abre editor → guardar → actualización parc
 - Streams modificados → se reinician (si estaban corriendo).
 - Streams sin cambios → no se tocan.
 - Si el nuevo INI no parsea → no se aplica y se devuelve error.
-- Siempre se respalda en `cadena_rcn.ini.bak` antes de sobrescribir.
+- Siempre se respalda en `db/<active>.ini.bak` antes de sobrescribir.
 
 ### Cambiar el título de la plataforma
 
