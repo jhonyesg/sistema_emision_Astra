@@ -135,6 +135,40 @@ Botones por fila (`Acciones`):
 
 ![Modal de comando FFmpeg](docs/images/modal-details-command.png)
 
+### Puente VLC (columna *Puente* y modal ✏️ por fila)
+
+Para algunos orígenes el audio AC-3 viene con metadatos que **rompen el contenedor FLV** (`Non-monotonous DTS in output stream` y el servidor RTMP descarta el stream). El sistema detecta ese caso y propone automáticamente montar un puente con VLC que re-muestrea el audio antes de pasárselo a FFmpeg.
+
+La columna **Puente** muestra el estado del puente VLC por stream:
+
+| Estado | Significado |
+|---|---|
+| `🔧 Activar VLC` (botón) | El último `ffprobe` detectó audio AC-3 problemático — un click lo activa. |
+| `✓ AAC` / `✓ MP3` | Codec compatible con FLV, no necesita puente. |
+| `⏳ Probando…` | Validación de audio en curso. |
+| `🔇 sin audio` | El origen no expone pista de audio. |
+| `⚠ VLC activo` | VLC está transcodificando para este stream. |
+
+Cuando el puente está activo, FFmpeg **no** lee la URL original sino `http://127.0.0.1:<puerto>/` (un puerto efímero del rango 18090–18099 asignado automáticamente por el manager, sin colisiones).
+
+![Modal de edición de stream con sección VLC](docs/images/edit-stream-vlc.png)
+
+### Edición rápida de un stream (✏️ por fila)
+
+Modal por fila que permite cambiar, **sin tocar otros streams**:
+
+- `Original_URL`, `Destination_URL`
+- `FFMPEG_PATH`, `VAAPI_DRIVER` (`i965` / `iHD` / vacío)
+- `FFMPEG_PRE_OPTIONS`, `FFMPEG_POST_OPTIONS` (avanzado)
+- `autostart`
+- **Puente VLC**: `VLC_TRANSCODE` (ej. `acodec=a52,ab=192,channels=2,samplerate=44100`) y `VLC_PORT` (0 = auto-asignar).
+
+Al guardar:
+
+1. Se actualiza sólo la sección `[<stream>]` del INI activo, conservando comentarios y secciones vecinas.
+2. Si el stream estaba corriendo, se reinicia con la nueva configuración.
+3. La caché de `ffprobe` para ese stream se invalida.
+
 ### Editor de INI (📝 en header)
 
 ![Modal editor de INI](docs/images/modal-ini.png)
@@ -328,7 +362,7 @@ sistema_emision_Astra/
 │   ├── .gitkeep
 │   ├── README.md
 │   ├── 1_default.ini       # Canales 01–10 (LAN 127.0.0.1:8000)
-│   └── 2_playlist.ini      # Canales 11–N (playlist 192.168.0.8:8000)
+│   └── 2_playlist.ini      # Canales 11–N (playlist en otra subred interna)
 ├── cadena_rcn.ini.example  # Plantilla sanitizada para el repo (usada por --init)
 ├── config.json             # Persistencia de toggles + platform_title + active_config (NO se commitea)
 ├── emisor_v1.sh            # Launcher con título personalizado + exporta ASTRA_INI
@@ -387,6 +421,11 @@ Acceso: `http://localhost:5006`.
 | GET | `/api/ini/read` | Leer archivo INI. |
 | POST | `/api/ini/write` | Guardar INI (validación + backup + actualización parcial). |
 | GET | `/api/errors` | Historial de últimos 5 reinicios / errores. |
+| POST | `/api/stream/<name>/update` | Edición rápida de un stream (URL, VLC, autostart, …) con reinicio si estaba corriendo. |
+| GET | `/api/audio-probe/<name>` | `ffprobe` del `Original_URL` para detectar codecs y recomendar puente VLC (cache 5 min). |
+| GET | `/api/audio-probe-batch` | Igual, para todos los streams (alimenta la columna *Puente*). |
+| GET | `/api/stream/<name>/vlc-status` | Estado del puente VLC de un stream (`enabled`, `pid`, `port`, `url`). |
+| POST | `/api/stream/<name>/vlc/restart` | Reinicia sólo el VLC de un stream (FFmpeg queda intacto). |
 
 ---
 
@@ -410,6 +449,8 @@ autostart=true
 | `autostart` | no | `true` / `false`. Iniciar al arranque (o en guardado del INI). |
 | `ffmpeg_path` | no | Ruta al binario ffmpeg (default `ffmpeg`). |
 | `vaapi_driver` | no | Driver VAAPI (`i965`, `iHD`). Se exporta como `LIBVA_DRIVER_NAME`. |
+| `VLC_TRANSCODE` | no | Cadena `transcode{...}` de VLC. Si está presente, se monta el puente de audio. |
+| `VLC_PORT` | no | Puerto HTTP local del puente VLC (rango 18090–18099 si es 0 o vacío). |
 
 > El comando final siempre lleva `-re` antepuesto. Ejemplo:
 > `ffmpeg -re -user_agent "Mozilla/5.0" -i <Original_URL> -c copy -f flv <Destination_URL>`
@@ -424,6 +465,73 @@ autostart=true
 | `auto_restart` | `true` | Si true, el monitor reinicia streams congelados o caídos. |
 | `midnight_restart` | `true` | Si true, a las 00:00–00:05 ejecuta `full_restart()` para liberar memoria. |
 | `platform_title` | `Sistema de Emisión 24/7-Astra` | Título del dashboard y de la pestaña del navegador (se sanitiza contra `<>"'&`, máx 100 chars). |
+
+---
+
+## Puente VLC (audio AC-3 → FLV)
+
+Algunos orígenes (típicamente HLS de cableoperadores) emiten **AC-3 con metadatos no estándar** (`bsid`, `dialnorm` corruptos). FFmpeg los acepta pero el muxer FLV/RTMP rechaza el stream entero con `Non-monotonous DTS in output stream`.
+
+La solución es intercalar **VLC como re-muestreador de audio**: VLC lee la fuente, decodifica el AC-3 y lo re-empaqueta en AAC/MP3 sobre HTTP local, y FFmpeg lee esa salida HTTP en lugar de la URL original.
+
+```
+[origen HLS/RTMP] ──► VLC (decodifica AC-3 + encode AAC) ──► http://127.0.0.1:18090/
+                                                                        │
+                                                                        ▼
+                                                              ffmpeg -i http://...
+                                                                        │
+                                                                        ▼
+                                                              rtmp://127.0.0.1:1935/live/<key>
+```
+
+### Activación
+
+- **Manual**: abrir el modal ✏️ del stream → marcar *Puente VLC* → escribir `VLC_TRANSCODE` (ej. `acodec=a52,ab=192,channels=2,samplerate=44100`) y dejar `VLC_PORT=0` para auto-asignar.
+- **Asistida**: pulsar `🔧 Activar VLC` en la columna *Puente* cuando el validador detecta el problema. El sistema inyecta una transcodificación por defecto y reinicia el stream.
+
+### Detección (ffprobe)
+
+`GET /api/audio-probe/<name>` ejecuta `ffprobe -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels -of json <Original_URL>` y cachea el resultado 5 minutos. Marca `needs_vlc=true` cuando:
+
+- `codec_name ∈ {ac3, eac3}`, **y**
+- `sample_rate` es 0 o ausente, **o** `channels` ≤ 0.
+
+### Pool de puertos
+
+El manager reserva un puerto del rango **18090–18099** por stream con VLC activo. El orden de preferencia es:
+
+1. `VLC_PORT` explícito del INI (si está libre).
+2. Primer puerto libre del rango, sin colisión con otros VLC.
+3. Si el rango está lleno, el stream no arranca y se registra en el historial de errores.
+
+Los puertos se liberan automáticamente cuando el stream se detiene o se elimina, y al cambiar de INI activo.
+
+---
+
+## Edición rápida de un stream (`POST /api/stream/<name>/update`)
+
+Pensado para cambios puntuales sin abrir el editor INI completo. Acepta un JSON con las claves permitidas (cualquier otra se ignora):
+
+```json
+{
+  "Original_URL": "https://nuevo-origen.example.com/stream",
+  "Destination_URL": "rtmp://127.0.0.1:1935/live/canal01",
+  "FFMPEG_PATH": "/usr/bin/ffmpeg",
+  "VAAPI_DRIVER": "iHD",
+  "FFMPEG_PRE_OPTIONS": "-re",
+  "FFMPEG_POST_OPTIONS": "-c copy -f flv",
+  "VLC_TRANSCODE": "acodec=a52,ab=192,channels=2,samplerate=44100",
+  "VLC_PORT": "0",
+  "autostart": true
+}
+```
+
+- `VLC_TRANSCODE=""` desactiva el puente y libera el puerto.
+- `VLC_PORT="0"` → auto-asignar del pool; cualquier otro valor se valida contra el rango 1024–65535 y se rechazan colisiones.
+- Si el stream estaba corriendo, se reinicia tras guardar.
+- Devuelve `{success, name, config}` con la config efectiva (o `warning` si el stream no pudo arrancar).
+
+---
 
 `platform_title` se puede editar desde la UI con el botón **✏️ Título**; al guardar se persiste en `config.json` y se aplica al `<h1>` y al `document.title`.
 
@@ -616,6 +724,10 @@ python tools/take_screenshots.py
 ```
 
 El script conecta a `http://127.0.0.1:5006`, espera a que la tabla se llene y guarda cada PNG en `docs/images/`. Útil cuando se quiere actualizar la documentación tras un cambio visual en la UI.
+
+> **Sanitización automática**: el script detecta el host SRT público dentro del modal *Comando* y lo reemplaza por `srt://<dominio-publico>:<puerto>?passphrase=**********` antes de capturar, de modo que las capturas subidas al repo no exponen credenciales ni hosts reales. Mantén esa lógica al regenerar las imágenes.
+
+> **Capturas pendientes tras la integración VLC**: la columna *Puente*, el modal ✏️ *Editar stream* y el indicador `🔧 Activar VLC` aún no tienen capturas propias. Se regeneran con `python tools/take_screenshots.py` sobre la app ya migrada.
 
 ---
 

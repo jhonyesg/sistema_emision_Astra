@@ -9,14 +9,14 @@ db/<número>_<nombre-libre>.ini
 ```
 
 - `<número>` define el orden en el desplegable (1, 2, 10, …).
-- `<nombre-libre>` lo eliges tú (ej.: `telemedellin`, `canal_medellin`, …).
+- `<nombre-libre>` lo eliges tú (ej.: `cliente_a`, `canal_principal`, …). Evita nombres que delanten el cliente o el operador real cuando el repo sea público.
 - Siempre terminan en `.ini`.
 
 Ejemplos:
 
 ```
-db/1_telemedellin.ini
-db/2_canal_local.ini
+db/1_cliente_a.ini
+db/2_canal_principal.ini
 db/3_pruebas.ini
 ```
 
