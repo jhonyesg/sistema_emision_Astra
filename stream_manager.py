@@ -89,9 +89,15 @@ class StreamInstance:
             return None
 
         original_url = self.config["original_url"]
-        port = self.config.get("vlc_port") or 18099
+        port = self.config.get("vlc_port")
+        if not port:
+            port = stream_manager.assign_vlc_port(exclude_name=self.name)
+        if not port:
+            logger.error(f"No hay puertos VLC libres para '{self.name}'")
+            return None
         self._vlc_port = port
         self._vlc_url = f"http://127.0.0.1:{port}"
+        stream_manager.reserve_vlc_port(port, self.name)
 
         # Detener VLC anterior si existe
         self._stop_vlc()
@@ -160,6 +166,10 @@ class StreamInstance:
             finally:
                 logger.info(f"VLC transcoder detenido para '{self.name}'")
                 self._vlc_process = None
+                if self._vlc_port:
+                    stream_manager.release_vlc_port(self._vlc_port)
+                    self._vlc_port = None
+                    self._vlc_url = None
 
     def start(self):
         if self.process and self.is_running():
@@ -364,6 +374,7 @@ class StreamInstance:
             last_lines_snapshot = list(self.last_lines)[-50:]
         with self._status_lock:
             status = self._status
+        cfg = self.config or {}
         return {
             "name": self.name,
             "status": status,
@@ -379,6 +390,25 @@ class StreamInstance:
             "restart_count": self.restart_count,
             "error_message": self.error_message,
             "pid": self.process.pid if self.process and self.is_running() else None,
+            "vlc": {
+                "enabled": bool(cfg.get("vlc_transcode")),
+                "active": self._vlc_process is not None
+                and self._vlc_process.poll() is None,
+                "pid": self._vlc_process.pid
+                if self._vlc_process and self._vlc_process.poll() is None
+                else None,
+                "port": self._vlc_port,
+                "url": self._vlc_url,
+            },
+            "original_url": cfg.get("original_url", ""),
+            "destination_url": cfg.get("destination_url", ""),
+            "ffmpeg_path": cfg.get("ffmpeg_path", ""),
+            "vaapi_driver": cfg.get("vaapi_driver", ""),
+            "ffmpeg_pre_options": cfg.get("ffmpeg_pre_options", ""),
+            "ffmpeg_post_options": cfg.get("ffmpeg_post_options", ""),
+            "vlc_transcode": cfg.get("vlc_transcode", ""),
+            "vlc_port": cfg.get("vlc_port"),
+            "autostart": bool(cfg.get("autostart", False)),
             "last_lines": last_lines_snapshot,
         }
 
@@ -402,6 +432,100 @@ class StreamManager:
         self.streams = {}
         self._lock = threading.RLock()
         self._error_history = deque(maxlen=5)
+        self._vlc_ports_used = set()
+        self._vlc_port_min = 18090
+        self._vlc_port_max = 18099
+
+    @staticmethod
+    def is_port_free(port):
+        if not isinstance(port, int) or port < 0 or port > 65535:
+            return False
+        import socket as _socket
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+            s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", port))
+                return True
+            except OSError:
+                return False
+
+    def assign_vlc_port(self, exclude_name=None):
+        """Devuelve el primer puerto libre del rango [18090..18099].
+
+        exclude_name: nombre del stream al que NO se le debe asignar puerto
+        (típicamente porque está reasignando y debe conservar el suyo).
+        """
+        used_by_others = {
+            port for port, owner in self._ports_by_owner().items()
+            if owner != exclude_name
+        }
+        for p in range(self._vlc_port_min, self._vlc_port_max + 1):
+            if p in used_by_others:
+                continue
+            if self.is_port_free(p):
+                return p
+        return None
+
+    def _ports_by_owner(self):
+        """Devuelve dict {puerto: nombre_stream} de todos los VLC activos en streams."""
+        out = {}
+        with self._lock:
+            for name, stream in self.streams.items():
+                p = stream.config.get("vlc_port") if stream.config else None
+                if p:
+                    out[int(p)] = name
+        return out
+
+    def release_vlc_port(self, port):
+        if not port:
+            return
+        with self._lock:
+            self._vlc_ports_used.discard(int(port))
+
+    def reserve_vlc_port(self, port, owner):
+        with self._lock:
+            self._vlc_ports_used.add(int(port))
+
+    def get_vlc_status_all(self):
+        """Snapshot del estado de VLC de todos los streams."""
+        with self._lock:
+            out = {}
+            for name, stream in self.streams.items():
+                cfg = stream.config or {}
+                enabled = bool(cfg.get("vlc_transcode"))
+                p = stream.process.poll() if stream.process else None
+                running = p is None
+                out[name] = {
+                    "enabled": enabled,
+                    "vlc_active": stream._vlc_process is not None
+                    and stream._vlc_process.poll() is None,
+                    "vlc_pid": stream._vlc_process.pid
+                    if stream._vlc_process and stream._vlc_process.poll() is None
+                    else None,
+                    "vlc_port": stream._vlc_port,
+                    "vlc_url": stream._vlc_url,
+                    "ffmpeg_running": running,
+                    "ffmpeg_pid": stream.process.pid if running else None,
+                }
+            return out
+
+    def get_vlc_status(self, name):
+        status = self.get_vlc_status_all()
+        return status.get(name)
+
+    def restart_vlc_only(self, name):
+        """Reinicia VLC de un stream sin tocar FFmpeg ni otros streams."""
+        with self._lock:
+            stream = self.streams.get(name)
+            if not stream:
+                return False, "Stream no encontrado"
+            if not stream.config.get("vlc_transcode"):
+                return False, "VLC no habilitado en este stream"
+        stream._stop_vlc()
+        new_url = stream._start_vlc()
+        if not new_url:
+            return False, "VLC no pudo arrancar"
+        return True, "VLC reiniciado"
 
     def register_stream(self, name, config):
         with self._lock:
@@ -409,6 +533,11 @@ class StreamManager:
                 self.streams[name] = StreamInstance(name, config)
                 logger.info(f"Stream registrado: {name}")
             else:
+                old_cfg = self.streams[name].config or {}
+                old_port = old_cfg.get("vlc_port")
+                new_port = config.get("vlc_port")
+                if old_port and old_port != new_port:
+                    self.release_vlc_port(old_port)
                 self.streams[name].config = config
                 logger.info(f"Config actualizada para stream: {name}")
 

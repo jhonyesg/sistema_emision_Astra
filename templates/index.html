@@ -98,16 +98,17 @@
             <table class="streams-table" id="streams-table">
                 <thead>
                     <tr>
-                        <th>#</th>
-                        <th class="sortable" data-sort="status">Estado <span class="sort-icon">&#8693;</span></th>
-                        <th class="sortable" data-sort="name">Stream <span class="sort-icon">&#8693;</span></th>
-                        <th class="sortable" data-sort="pid">PID <span class="sort-icon">&#8693;</span></th>
-                        <th class="sortable" data-sort="bitrate">Bitrate <span class="sort-icon">&#8693;</span></th>
-                        <th class="sortable" data-sort="size">Tama&ntilde;o <span class="sort-icon">&#8693;</span></th>
-                        <th class="sortable" data-sort="speed">Velocidad <span class="sort-icon">&#8693;</span></th>
-                        <th class="sortable" data-sort="uptime">Uptime <span class="sort-icon">&#8693;</span></th>
-                        <th class="sortable" data-sort="restarts">RST <span class="sort-icon">&#8693;</span></th>
-                        <th>Acciones</th>
+<th>#</th>
+                    <th class="sortable" data-sort="status">Estado <span class="sort-icon">&#8693;</span></th>
+                    <th class="sortable" data-sort="name">Stream <span class="sort-icon">&#8693;</span></th>
+                    <th title="Puente VLC activo">Puente</th>
+                    <th class="sortable" data-sort="pid">PID <span class="sort-icon">&#8693;</span></th>
+                    <th class="sortable" data-sort="bitrate">Bitrate <span class="sort-icon">&#8693;</span></th>
+                    <th class="sortable" data-sort="size">Tama&ntilde;o <span class="sort-icon">&#8693;</span></th>
+                    <th class="sortable" data-sort="speed">Velocidad <span class="sort-icon">&#8693;</span></th>
+                    <th class="sortable" data-sort="uptime">Uptime <span class="sort-icon">&#8693;</span></th>
+                    <th class="sortable" data-sort="restarts">RST <span class="sort-icon">&#8693;</span></th>
+                    <th>Acciones</th>
                     </tr>
                 </thead>
                 <tbody id="streams-tbody">
@@ -165,6 +166,88 @@
                     <button class="btn btn-primary" onclick="createConfig()">💾 Crear</button>
                     <button class="btn" onclick="closeNewConfig()">Cancelar</button>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="edit-stream-modal" class="modal">
+        <div class="modal-content modal-lg">
+            <div class="modal-header">
+                <h2 id="edit-stream-title">Editar Stream</h2>
+                <button class="modal-close" onclick="closeEditStream()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="edit-stream-body" class="edit-stream-form">
+                    <div class="form-row">
+                        <label>Nombre (sección INI)</label>
+                        <input type="text" id="es-name" readonly>
+                    </div>
+                    <div class="form-row">
+                        <label>Original_URL (origen)</label>
+                        <input type="text" id="es-original-url">
+                    </div>
+                    <div class="form-row">
+                        <label>Destination_URL (RTMP destino)</label>
+                        <input type="text" id="es-destination-url">
+                    </div>
+                    <div class="form-row-inline">
+                        <div>
+                            <label>FFMPEG_PATH</label>
+                            <input type="text" id="es-ffmpeg-path">
+                        </div>
+                        <div>
+                            <label>VAAPI_DRIVER</label>
+                            <input type="text" id="es-vaapi-driver" placeholder="i965 / iHD / (vacío)">
+                        </div>
+                    </div>
+                    <details class="form-advanced">
+                        <summary>FFMPEG_PRE/POST opciones (avanzado)</summary>
+                        <div class="form-row">
+                            <label>FFMPEG_PRE_OPTIONS</label>
+                            <textarea id="es-pre-options" rows="2"></textarea>
+                        </div>
+                        <div class="form-row">
+                            <label>FFMPEG_POST_OPTIONS</label>
+                            <textarea id="es-post-options" rows="3"></textarea>
+                        </div>
+                    </details>
+
+                    <hr>
+
+                    <div class="form-row-inline">
+                        <label class="toggle-label-inline">
+                            <input type="checkbox" id="es-vlc-enabled">
+                            <span>Puente VLC (audio AC-3 corrupto)</span>
+                        </label>
+                    </div>
+                    <div id="es-vlc-fields" class="vlc-fields" style="display:none;">
+                        <div class="form-row-inline">
+                            <div>
+                                <label>VLC_TRANSCODE</label>
+                                <input type="text" id="es-vlc-transcode"
+                                    placeholder="acodec=a52,ab=192,channels=2,samplerate=44100">
+                            </div>
+                            <div>
+                                <label>VLC_PORT (0 = auto)</label>
+                                <input type="number" id="es-vlc-port" min="0" max="18099">
+                            </div>
+                        </div>
+                        <div id="es-vlc-port-hint" class="form-hint"></div>
+                    </div>
+
+                    <div class="form-row-inline">
+                        <label class="toggle-label-inline">
+                            <input type="checkbox" id="es-autostart">
+                            <span>Auto-inicio al arrancar plataforma</span>
+                        </label>
+                    </div>
+
+                    <div id="es-warning" class="form-warning" style="display:none;"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="closeEditStream()">Cancelar</button>
+                <button class="btn btn-primary" onclick="saveEditStream()">💾 Guardar y aplicar</button>
             </div>
         </div>
     </div>
@@ -534,6 +617,7 @@
                     <span class="status-text">${statusText[stream.status] || stream.status}</span>
                 </td>
                 <td class="cell-name">${escapeHtml(name)}</td>
+                <td class="cell-bridge">${renderBridgeCell(name, stream.vlc)}</td>
                 <td class="cell-pid">${stream.pid || '-'}</td>
                 <td class="cell-bitrate">${stream.bitrate || '-'}</td>
                 <td class="cell-size">${stream.file_size || '-'}</td>
@@ -545,6 +629,7 @@
                     <button class="btn btn-xs btn-danger" onclick="stopStream('${escapeHtml(name)}')" ${stream.status !== 'running' ? 'disabled' : ''}>■</button>
                     <button class="btn btn-xs btn-warning" onclick="restartStream('${escapeHtml(name)}')">↻</button>
                     <button class="btn btn-xs btn-info" onclick="showDetails('${escapeHtml(name)}')" title="Logs y Comando">📋</button>
+                    <button class="btn btn-xs btn-secondary" onclick="showEditStream('${escapeHtml(name)}')" title="Editar stream (URL, VLC, etc.)">✏️</button>
                 </td>
             `;
             return tr;
@@ -685,6 +770,242 @@
                 window.logRefreshInterval = setInterval(refreshLogs, 2000);
             }
         }
+
+        // ============ Validar audio del origen (bajo demanda, resultado en toast) ============
+        async function validateAudio(name, anchor) {
+            if (anchor) {
+                anchor.classList.add('bridge-validating');
+                anchor.disabled = true;
+                anchor.dataset.originalText = anchor.textContent;
+                anchor.textContent = '⏳ Probando…';
+            }
+            showToast(`Probando audio de ${name}…`, 'info', 8000);
+            let probe;
+            try {
+                const res = await fetch(`${API_BASE}/audio-probe/${encodeURIComponent(name)}`);
+                probe = await res.json();
+            } catch (e) {
+                probe = { success: false, codec: 'error', error: String(e) };
+            }
+
+            const codec = (probe.codec || 'unknown').toUpperCase();
+            let msg, type;
+            if (probe.needs_vlc) {
+                msg = `${name}: ⚠ AC-3 corrupto (${probe.channels || 0}ch, ${probe.sample_rate || 0}Hz) — pulsa 🔧 Activar VLC`;
+                type = 'warning';
+                if (anchor) {
+                    anchor.classList.remove('bridge-validating');
+                    anchor.classList.add('bridge-activate-btn');
+                    anchor.disabled = false;
+                    anchor.dataset.mode = 'activate-vlc';
+                    anchor.textContent = '🔧 Activar VLC';
+                    anchor.title = 'Click para activar puente VLC automáticamente';
+                }
+            } else if (codec === 'AAC' || codec === 'MP3' || codec === 'MP2') {
+                msg = `${name}: ✓ ${codec} ${probe.channels || '?'}ch @ ${probe.sample_rate || '?'}Hz — compatible FLV, no requiere VLC`;
+                type = 'success';
+                if (anchor) {
+                    anchor.classList.remove('bridge-validating');
+                    anchor.disabled = false;
+                    anchor.textContent = `✓ ${codec}`;
+                    anchor.title = 'Audio compatible, no se necesita VLC';
+                }
+            } else if (codec === 'NO_AUDIO') {
+                msg = `${name}: 🔇 sin pista de audio`;
+                type = 'warning';
+                if (anchor) {
+                    anchor.classList.remove('bridge-validating');
+                    anchor.disabled = false;
+                    anchor.textContent = '🔇 sin audio';
+                    anchor.title = 'Origen sin pista de audio';
+                }
+            } else {
+                msg = `${name}: ? no se pudo probar (${probe.error || codec})`;
+                type = 'error';
+                if (anchor) {
+                    anchor.classList.remove('bridge-validating');
+                    anchor.disabled = false;
+                    anchor.textContent = anchor.dataset.originalText || '🔍 Validar';
+                }
+            }
+            showToast(msg, type, 8000);
+        }
+
+        async function activateVlc(name, anchor) {
+            if (!confirm(`¿Activar puente VLC en ${name}?\n\nEsto reiniciará solo este stream (los demás siguen emitiendo).`)) return;
+            anchor.classList.add('bridge-validating');
+            anchor.disabled = true;
+            anchor.textContent = '⏳ Activando…';
+            try {
+                const res = await fetch(`${API_BASE}/stream/${encodeURIComponent(name)}/update`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        VLC_TRANSCODE: 'acodec=a52,ab=192,channels=2,samplerate=44100',
+                        VLC_PORT: '0',
+                    }),
+                });
+                const data = await res.json();
+                if (data.success) {
+                    const port = data.config && data.config.vlc_port;
+                    showToast(`✓ ${name}: VLC activado en puerto ${port}, stream reiniciado`, 'success', 8000);
+                    fetchStatus();
+                } else {
+                    anchor.classList.remove('bridge-validating');
+                    anchor.disabled = false;
+                    anchor.textContent = '🔧 Activar VLC';
+                    showToast(`Error activando VLC: ${data.error || 'desconocido'}`, 'error', 6000);
+                }
+            } catch (e) {
+                anchor.classList.remove('bridge-validating');
+                anchor.disabled = false;
+                anchor.textContent = '🔧 Activar VLC';
+                showToast(`Error de conexión`, 'error', 6000);
+            }
+        }
+
+        // ============ Puente VLC column ============
+        function renderBridgeCell(name, vlc) {
+            if (!vlc || !vlc.enabled) {
+                return `<button class="bridge-validate-btn"
+                    data-stream="${escapeHtml(name)}"
+                    data-mode="validate"
+                    onclick="event.stopPropagation();onBridgeBtnClick('${escapeHtml(name)}', this)"
+                    title="Probar codec de audio del origen (no automático)">🔍 Validar</button>`;
+            }
+            const active = vlc.active;
+            const port = vlc.port || '?';
+            const pid = vlc.pid || '?';
+            const cls = active ? 'bridge-active' : 'bridge-inactive';
+            const ico = active ? '🌐' : '⚠️';
+            const tip = `VLC puerto ${port} | PID ${pid} | ${active ? 'activo' : 'caído'}`;
+            return `<span class="bridge-cell ${cls}" title="${tip}"
+                onclick="event.stopPropagation();showBridgeMenu('${escapeHtml(name)}', this)">${ico} :${port}</span>`;
+        }
+
+        function onBridgeBtnClick(name, anchor) {
+            const mode = anchor.dataset.mode || 'validate';
+            if (mode === 'activate-vlc') {
+                activateVlc(name, anchor);
+            } else {
+                validateAudio(name, anchor);
+            }
+        }
+
+        function showBridgeMenu(name, anchor) {
+            closeBridgeMenu();
+            const menu = document.createElement('div');
+            menu.className = 'bridge-menu';
+            menu.id = 'bridge-menu';
+            menu.innerHTML = `
+                <button onclick="restartVlcOnly('${escapeHtml(name)}')">🔄 Reiniciar VLC</button>
+                <button onclick="stopStream('${escapeHtml(name)}');closeBridgeMenu()">■ Detener stream (y VLC)</button>
+                <button onclick="showEditStream('${escapeHtml(name)}');closeBridgeMenu()">✏️ Editar VLC settings</button>
+            `;
+            const r = anchor.getBoundingClientRect();
+            menu.style.top = (window.scrollY + r.bottom + 4) + 'px';
+            menu.style.left = (window.scrollX + r.left) + 'px';
+            document.body.appendChild(menu);
+            setTimeout(() => {
+                document.addEventListener('click', closeBridgeMenu, { once: true });
+            }, 0);
+        }
+        function closeBridgeMenu() {
+            const m = document.getElementById('bridge-menu');
+            if (m) m.remove();
+        }
+
+        async function restartVlcOnly(name) {
+            closeBridgeMenu();
+            try {
+                const res = await fetch(`${API_BASE}/stream/${encodeURIComponent(name)}/vlc/restart`, { method: 'POST' });
+                const data = await res.json();
+                showToast(data.success ? `${name}: VLC reiniciado` : `${name}: ${data.message || 'error'}`, data.success ? 'success' : 'error');
+                fetchStatus();
+            } catch (e) {
+                showToast(`${name}: error de conexión`, 'error');
+            }
+        }
+
+        // ============ Edit Stream modal ============
+        async function showEditStream(name) {
+            const stream = streamsData[name];
+            if (!stream) {
+                showToast(`${name}: no encontrado`, 'error');
+                return;
+            }
+            document.getElementById('edit-stream-title').textContent = `Editar: ${name}`;
+            document.getElementById('es-name').value = name;
+            document.getElementById('es-original-url').value = stream.original_url || '';
+            document.getElementById('es-destination-url').value = stream.destination_url || '';
+            document.getElementById('es-ffmpeg-path').value = stream.ffmpeg_path || '';
+            document.getElementById('es-vaapi-driver').value = stream.vaapi_driver || '';
+            document.getElementById('es-pre-options').value = stream.ffmpeg_pre_options || '';
+            document.getElementById('es-post-options').value = stream.ffmpeg_post_options || '';
+            document.getElementById('es-autostart').checked = !!stream.autostart;
+
+            const vlcEnabled = !!(stream.vlc && stream.vlc.enabled);
+            document.getElementById('es-vlc-enabled').checked = vlcEnabled;
+            document.getElementById('es-vlc-transcode').value = stream.vlc_transcode || 'acodec=a52,ab=192,channels=2,samplerate=44100';
+            document.getElementById('es-vlc-port').value = (stream.vlc_port || 0);
+            toggleVlcFields();
+
+            document.getElementById('edit-stream-modal').style.display = 'flex';
+        }
+
+        function closeEditStream() {
+            document.getElementById('edit-stream-modal').style.display = 'none';
+            document.getElementById('es-warning').classList.remove('form-warning-ok');
+        }
+
+        function toggleVlcFields() {
+            const on = document.getElementById('es-vlc-enabled').checked;
+            document.getElementById('es-vlc-fields').style.display = on ? 'block' : 'none';
+        }
+
+        async function saveEditStream() {
+            const name = document.getElementById('es-name').value;
+            const vlcEnabled = document.getElementById('es-vlc-enabled').checked;
+            const updates = {
+                Original_URL: document.getElementById('es-original-url').value.trim(),
+                Destination_URL: document.getElementById('es-destination-url').value.trim(),
+                FFMPEG_PATH: document.getElementById('es-ffmpeg-path').value.trim(),
+                VAAPI_DRIVER: document.getElementById('es-vaapi-driver').value.trim(),
+                FFMPEG_PRE_OPTIONS: document.getElementById('es-pre-options').value.trim(),
+                FFMPEG_POST_OPTIONS: document.getElementById('es-post-options').value.trim(),
+                autostart: document.getElementById('es-autostart').checked ? 'true' : 'false',
+            };
+            if (vlcEnabled) {
+                updates.VLC_TRANSCODE = document.getElementById('es-vlc-transcode').value.trim();
+                updates.VLC_PORT = String(parseInt(document.getElementById('es-vlc-port').value || '0', 10));
+            } else {
+                updates.VLC_TRANSCODE = '';
+                updates.VLC_PORT = '';
+            }
+
+            showToast(`Aplicando cambios a ${name}…`, 'info', 4000);
+            try {
+                const res = await fetch(`${API_BASE}/stream/${encodeURIComponent(name)}/update`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(updates),
+                });
+                const data = await res.json();
+                if (data.success) {
+                    showToast(`${name}: actualizado y reiniciado`, 'success', 5000);
+                    closeEditStream();
+                    fetchStatus();
+                } else {
+                    showToast(`Error: ${data.error || 'desconocido'}`, 'error', 6000);
+                }
+            } catch (e) {
+                showToast(`Error de conexión`, 'error');
+            }
+        }
+
+        document.addEventListener('change', (e) => {
+            if (e.target && e.target.id === 'es-vlc-enabled') toggleVlcFields();
+        });
 
         async function loadCommand(name) {
             try {

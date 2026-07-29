@@ -452,6 +452,183 @@ def restart_stream(name):
     return jsonify({"success": success, "name": name})
 
 
+_AUDIO_PROBE_CACHE = {}
+_AUDIO_PROBE_TTL = 300
+
+
+def _probe_audio_codec(url, timeout=5):
+    """Devuelve dict con codec, sample_rate, channels, needs_vlc o None si falla."""
+    try:
+        cmd = [
+            "/usr/bin/ffprobe", "-hide_banner", "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=codec_name,sample_rate,channels",
+            "-of", "json",
+            "-timeout", str(timeout * 1000000),
+            url,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+        if r.returncode != 0:
+            return {"codec": "unknown", "sample_rate": None, "channels": None,
+                    "needs_vlc": False, "error": r.stderr.strip()[:200] or "ffprobe failed"}
+        import json as _json
+        data = _json.loads(r.stdout or "{}")
+        streams = data.get("streams") or []
+        if not streams:
+            return {"codec": "no_audio", "sample_rate": None, "channels": None,
+                    "needs_vlc": False, "error": "no audio stream"}
+        s = streams[0]
+        codec = s.get("codec_name", "unknown")
+        sample_rate = s.get("sample_rate")
+        channels = s.get("channels")
+        needs_vlc = (
+            codec in ("ac3", "eac3")
+            and (not sample_rate or sample_rate == "0"
+                 or not channels or int(channels or 0) <= 0)
+        )
+        return {
+            "codec": codec,
+            "sample_rate": sample_rate,
+            "channels": channels,
+            "needs_vlc": needs_vlc,
+        }
+    except subprocess.TimeoutExpired:
+        return {"codec": "timeout", "sample_rate": None, "channels": None,
+                "needs_vlc": False, "error": "ffprobe timeout"}
+    except (OSError, ValueError) as e:
+        return {"codec": "error", "sample_rate": None, "channels": None,
+                "needs_vlc": False, "error": str(e)[:200]}
+
+
+@app.route("/api/audio-probe/<name>")
+def audio_probe(name):
+    stream = stream_manager.streams.get(name)
+    if not stream:
+        return jsonify({"success": False, "error": "Stream no encontrado"}), 404
+    url = stream.config.get("original_url")
+    if not url:
+        return jsonify({"success": False, "error": "Sin Original_URL"}), 400
+
+    now = time.time()
+    cached = _AUDIO_PROBE_CACHE.get(name)
+    if cached and (now - cached["ts"]) < _AUDIO_PROBE_TTL:
+        return jsonify({"success": True, "cached": True, **cached["data"]})
+
+    result = _probe_audio_codec(url)
+    _AUDIO_PROBE_CACHE[name] = {"ts": now, "data": result}
+    return jsonify({"success": True, "cached": False, **result})
+
+
+@app.route("/api/audio-probe-batch")
+def audio_probe_batch():
+    out = {}
+    for name in list(stream_manager.streams.keys()):
+        stream = stream_manager.streams.get(name)
+        if not stream:
+            continue
+        url = stream.config.get("original_url")
+        if not url:
+            out[name] = {"codec": "unknown", "needs_vlc": False, "error": "no url"}
+            continue
+        now = time.time()
+        cached = _AUDIO_PROBE_CACHE.get(name)
+        if cached and (now - cached["ts"]) < _AUDIO_PROBE_TTL:
+            out[name] = {**cached["data"], "cached": True}
+        else:
+            result = _probe_audio_codec(url)
+            _AUDIO_PROBE_CACHE[name] = {"ts": now, "data": result}
+            out[name] = {**result, "cached": False}
+    return jsonify({"success": True, "probes": out})
+
+
+@app.route("/api/stream/<name>/vlc-status")
+def vlc_status(name):
+    s = stream_manager.get_vlc_status(name)
+    if s is None:
+        return jsonify({"success": False, "error": "Stream no encontrado"}), 404
+    return jsonify({"success": True, "name": name, **s})
+
+
+@app.route("/api/stream/<name>/vlc/restart", methods=["POST"])
+def vlc_restart(name):
+    ok, msg = stream_manager.restart_vlc_only(name)
+    return jsonify({"success": ok, "name": name, "message": msg})
+
+
+@app.route("/api/stream/<name>/update", methods=["POST"])
+def stream_update(name):
+    from config_parser import update_stream_section
+    if name not in stream_manager.streams:
+        return jsonify({"success": False, "error": "Stream no registrado"}), 404
+
+    data = request.json or {}
+    allowed_keys = {
+        "Original_URL", "Destination_URL", "FFMPEG_PATH",
+        "FFMPEG_PRE_OPTIONS", "FFMPEG_POST_OPTIONS",
+        "VAAPI_DRIVER", "VLC_TRANSCODE", "VLC_PORT", "autostart",
+    }
+    updates = {k: v for k, v in data.items() if k in allowed_keys}
+
+    vlc_trans = updates.get("VLC_TRANSCODE")
+    if "VLC_TRANSCODE" in updates:
+        if isinstance(vlc_trans, str) and vlc_trans.strip() == "":
+            updates["VLC_TRANSCODE"] = ""
+            updates["VLC_PORT"] = ""
+        else:
+            if "VLC_PORT" not in updates:
+                updates["VLC_PORT"] = "0"
+
+    if "VLC_PORT" in updates:
+        vp = updates["VLC_PORT"]
+        if vp in (None, "", "0"):
+            del updates["VLC_PORT"]
+        else:
+            try:
+                port_int = int(vp)
+            except (TypeError, ValueError):
+                return jsonify({"success": False,
+                                "error": "VLC_PORT inválido"}), 400
+            if port_int < 1024 or port_int > 65535:
+                return jsonify({"success": False,
+                                "error": "VLC_PORT fuera de rango (1024-65535)"}), 400
+            if not stream_manager.is_port_free(port_int):
+                with stream_manager._lock:
+                    used = stream_manager._ports_by_owner()
+                if port_int in used and used[port_int] != name:
+                    return jsonify({"success": False,
+                                    "error": f"Puerto {port_int} ya lo usa {used[port_int]}"}), 409
+                return jsonify({"success": False,
+                                "error": f"Puerto {port_int} ocupado"}), 409
+            updates["VLC_PORT"] = str(port_int)
+
+    ini_path = resolve_active_ini_path()
+    if not ini_path or not os.path.isfile(ini_path):
+        return jsonify({"success": False, "error": "INI activo no encontrado"}), 500
+
+    ok, err, old_section = update_stream_section(ini_path, name, updates)
+    if not ok:
+        return jsonify({"success": False, "error": err}), 400
+
+    new_cfg = load_config(ini_path).get_stream_by_name(name)
+    if not new_cfg:
+        return jsonify({"success": False, "error": "Stream desapareció tras update"}), 500
+
+    was_running = stream_manager.streams[name].is_running()
+    stream_manager.register_stream(name, new_cfg)
+
+    if was_running:
+        stream_manager.stop_stream(name)
+        time.sleep(1)
+        started = stream_manager.start_stream(name)
+        if not started:
+            return jsonify({"success": True,
+                            "warning": "INI actualizado pero el stream no arrancó",
+                            "config": new_cfg}), 200
+
+    _AUDIO_PROBE_CACHE.pop(name, None)
+    return jsonify({"success": True, "name": name, "config": new_cfg})
+
+
 @app.route("/api/logs/<name>")
 def get_logs(name):
     try:
