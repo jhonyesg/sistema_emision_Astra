@@ -34,6 +34,11 @@ class ConfigParser:
                 "vaapi_driver": self._get_value(section, "VAAPI_DRIVER")
                 or self._get_value(section, "vaapi_driver")
                 or "",
+                "vlc_transcode": self._get_value(section, "VLC_TRANSCODE")
+                or self._get_value(section, "vlc_transcode")
+                or "",
+                "vlc_port": int(self._get_value(section, "VLC_PORT", "0") or 0)
+                or None,
                 "autostart": self._get_value(section, "autostart", "false").lower()
                 == "true",
             }

@@ -466,7 +466,7 @@ def get_logs(name):
 def get_command(name):
     if name in stream_manager.streams:
         stream = stream_manager.streams[name]
-        cmd = stream.build_ffmpeg_command()
+        cmd = stream.build_ffmpeg_command(stream._vlc_url if stream._vlc_process else None)
         quoted_cmd = []
         for arg in cmd:
             if "://" in arg or arg.startswith("rtmp") or "(" in arg or ")" in arg:
@@ -609,6 +609,10 @@ def write_ini():
             or old_s["destination_url"] != new_s["destination_url"]
             or old_s["ffmpeg_pre_options"] != new_s["ffmpeg_pre_options"]
             or old_s["ffmpeg_post_options"] != new_s["ffmpeg_post_options"]
+            or old_s.get("ffmpeg_path", "") != new_s.get("ffmpeg_path", "")
+            or old_s.get("vaapi_driver", "") != new_s.get("vaapi_driver", "")
+            or old_s.get("vlc_transcode", "") != new_s.get("vlc_transcode", "")
+            or old_s.get("vlc_port") != new_s.get("vlc_port")
         ):
             changed.add(name)
 

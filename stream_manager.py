@@ -20,6 +20,9 @@ class StreamInstance:
         self.name = name
         self.config = config
         self.process = None
+        self._vlc_process = None
+        self._vlc_port = None
+        self._vlc_url = None
         self._status = "stopped"
         self.bitrate = "0 kbps"
         self.video_bitrate = ""
@@ -57,10 +60,10 @@ class StreamInstance:
         with self._logs_lock:
             self._last_frame_time = value
 
-    def build_ffmpeg_command(self):
+    def build_ffmpeg_command(self, override_url=None):
         ffmpeg_path = self.config.get("ffmpeg_path") or "ffmpeg"
         pre_opts = self.config.get("ffmpeg_pre_options", "")
-        original_url = self.config["original_url"]
+        original_url = override_url or self.config["original_url"]
         post_opts = self.config.get("ffmpeg_post_options", "")
         destination_url = self.config["destination_url"]
 
@@ -80,6 +83,84 @@ class StreamInstance:
             env["LIBVA_DRIVER_NAME"] = vaapi_driver
         return env
 
+    def _start_vlc(self):
+        vlc_transcode = self.config.get("vlc_transcode", "")
+        if not vlc_transcode:
+            return None
+
+        original_url = self.config["original_url"]
+        port = self.config.get("vlc_port") or 18099
+        self._vlc_port = port
+        self._vlc_url = f"http://127.0.0.1:{port}"
+
+        # Detener VLC anterior si existe
+        self._stop_vlc()
+
+        # Cadena de transcodificación de VLC:
+        # Solo transcodifica el audio (AC-3 corrupto → AC-3 limpio),
+        # el video pasa sin tocar (passthrough).
+        sout = (
+            f"#transcode{{{vlc_transcode}}}"
+            f":standard{{access=http,mux=ts,dst=127.0.0.1:{port}}}"
+        )
+        cmd = [
+            "cvlc",
+            "--no-video-title-show",
+            "--no-daemon",
+            "--no-interact",
+            "--no-stats",
+            "--rtsp-tcp",
+            original_url,
+            "--sout", sout,
+            "--no-sout-all",
+            "--sout-keep",
+            "--sout-mux-caching=3000",
+            "--network-caching=3000",
+        ]
+
+        logger.info(f"Iniciando VLC transcoder para '{self.name}' en puerto {port}")
+        try:
+            self._vlc_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+            )
+            # Esperar a que VLC esté listo (el puerto acepte conexiones)
+            import socket as _socket
+            for _ in range(30):
+                try:
+                    with _socket.create_connection(("127.0.0.1", port), timeout=1):
+                        logger.info(f"VLC transcoder listo en puerto {port}")
+                        return self._vlc_url
+                except (OSError, ConnectionRefusedError):
+                    if self._vlc_process.poll() is not None:
+                        logger.error(f"VLC murió durante el arranque para '{self.name}'")
+                        self._vlc_process = None
+                        return None
+                    time.sleep(1)
+            logger.warning(f"VLC no respondió en puerto {port} tras 30s")
+            return self._vlc_url
+        except (OSError, ValueError) as e:
+            logger.error(f"Error iniciando VLC para '{self.name}': {e}")
+            self._vlc_process = None
+            return None
+
+    def _stop_vlc(self):
+        if self._vlc_process:
+            try:
+                self._vlc_process.terminate()
+                try:
+                    self._vlc_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._vlc_process.kill()
+                    self._vlc_process.wait(timeout=3)
+            except (OSError, ValueError):
+                pass
+            finally:
+                logger.info(f"VLC transcoder detenido para '{self.name}'")
+                self._vlc_process = None
+
     def start(self):
         if self.process and self.is_running():
             return False
@@ -96,8 +177,19 @@ class StreamInstance:
         self.file_size = ""
         self.speed = ""
 
+        # Si el stream tiene VLC_TRANSCODE configurado, arrancar VLC primero
+        # y usar la URL del VLC como entrada de FFmpeg.
+        vlc_url = None
+        if self.config.get("vlc_transcode"):
+            vlc_url = self._start_vlc()
+            if vlc_url is None:
+                self._status = "error"
+                self.error_message = "VLC transcoder no pudo iniciar"
+                logger.error(f"VLC transcoder falló para '{self.name}', no se inicia FFmpeg")
+                return False
+
         try:
-            cmd = self.build_ffmpeg_command()
+            cmd = self.build_ffmpeg_command(vlc_url)
             logger.info(f"Iniciando stream '{self.name}': {' '.join(cmd)}")
 
             self.process = subprocess.Popen(
@@ -237,6 +329,7 @@ class StreamInstance:
                             s.close()
                     except (OSError, ValueError):
                         pass
+        self._stop_vlc()
         self._status = "stopped"
         self.start_time = None
         logger.info(f"Stream '{self.name}' detenido")
