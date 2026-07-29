@@ -60,6 +60,7 @@
                 <span id="net-usage" class="status-value">-</span>
             </div>
             <div class="status-message">
+                <span id="service-name" class="status-value" title="Servicio systemd configurado en el INI activo">⚙️ -</span>
                 <span id="system-message" class="system-message"></span>
             </div>
         </div>
@@ -463,6 +464,13 @@
                 document.getElementById('auto-start-toggle').checked = data.start_all_on_boot;
                 document.getElementById('auto-restart-toggle').checked = data.auto_restart;
                 document.getElementById('midnight-toggle').checked = data.midnight_restart;
+                const serviceEl = document.getElementById('service-name');
+                if (serviceEl) {
+                    serviceEl.textContent = data.service ? `⚙️ ${data.service}` : '⚙️ (sin servicio systemd)';
+                    serviceEl.title = data.service
+                        ? 'El botón ↻ usará: sudo systemctl restart ' + data.service
+                        : 'El botón ↻ usará restart_platform.sh';
+                }
                 if (data.platform_title) {
                     document.getElementById('platform-title').textContent = '📺 ' + data.platform_title;
                     document.title = data.platform_title;

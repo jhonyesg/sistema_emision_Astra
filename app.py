@@ -171,7 +171,7 @@ def _apply_deployment_overrides():
     """Lee [servidor] del INI activo y sobreescribe Title/Network/toggles.
     Se llama al arranque y cada vez que se activa una config nueva.
     """
-    global PLATFORM_TITLE, NET_INTERFACE
+    global PLATFORM_TITLE, NET_INTERFACE, SERVICE_NAME
     global START_ALL_ON_BOOT, MIDNIGHT_RESTART_ENABLED, AUTO_RESTART_ENABLED
     try:
         overrides = load_deployment_overrides(resolve_active_ini_path())
@@ -183,6 +183,8 @@ def _apply_deployment_overrides():
         app_config["platform_title"] = PLATFORM_TITLE
     if overrides.get("network"):
         NET_INTERFACE = overrides["network"]
+    if overrides.get("service"):
+        SERVICE_NAME = overrides["service"]
     for key in ("start_all_on_boot", "midnight_restart", "auto_restart"):
         if overrides.get(key) is not None:
             val = bool(overrides[key])
@@ -289,6 +291,7 @@ START_ALL_ON_BOOT = app_config.get("start_all_on_boot", True)
 MIDNIGHT_RESTART_ENABLED = app_config.get("midnight_restart", True)
 AUTO_RESTART_ENABLED = app_config.get("auto_restart", True)
 PLATFORM_TITLE = app_config.get("platform_title", _DEFAULT_TITLE)
+SERVICE_NAME = ""
 _CONFIG_LOCK = threading.Lock()
 
 _apply_deployment_overrides()
@@ -674,6 +677,22 @@ def stop_all():
 
 @app.route("/api/restart_platform", methods=["POST"])
 def restart_platform():
+    if SERVICE_NAME:
+        logger.info(f"Reiniciando servicio systemd: {SERVICE_NAME}")
+        try:
+            subprocess.Popen(
+                ["sudo", "-n", "systemctl", "restart", SERVICE_NAME],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception:
+            logger.exception("Error lanzando systemctl restart")
+            return jsonify({"success": False, "error": "No se pudo lanzar systemctl"}), 500
+        time.sleep(0.5)
+        os._exit(0)
+        return jsonify({"success": True, "method": "systemd", "service": SERVICE_NAME})
+
     restart_script = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "restart_platform.sh"
     )
@@ -842,6 +861,7 @@ def get_config():
         "auto_restart": AUTO_RESTART_ENABLED,
         "platform_title": PLATFORM_TITLE,
         "network": NET_INTERFACE,
+        "service": SERVICE_NAME,
     })
 
 
@@ -1040,6 +1060,72 @@ def configs_delete(name):
     return jsonify({"success": True})
 
 
+class IniChangeWatcher:
+    """Vigila el INI activo y sincroniza streams añadidos/eliminados en caliente."""
+
+    def __init__(self, interval=10):
+        self._interval = interval
+        self._running = False
+        self._thread = None
+        self._last_mtime = None
+        self._last_ini_path = None
+        self._lock = threading.Lock()
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="IniWatcher")
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def _snapshot(self, ini_path):
+        try:
+            cfg = load_config(ini_path)
+            return {s["name"]: s for s in cfg.get_all_streams()}
+        except (configparser.Error, OSError, ValueError):
+            return None
+
+    def _loop(self):
+        while self._running:
+            try:
+                ini_path = resolve_active_ini_path()
+                if ini_path and os.path.isfile(ini_path):
+                    mtime = os.path.getmtime(ini_path)
+                    changed_file = (
+                        self._last_ini_path != ini_path or self._last_mtime != mtime
+                    )
+                    if changed_file:
+                        streams = self._snapshot(ini_path)
+                        if streams is not None:
+                            self._sync(streams)
+                            self._last_mtime = mtime
+                            self._last_ini_path = ini_path
+            except Exception as e:
+                logger.warning(f"INI watcher error: {e}")
+            time.sleep(self._interval)
+
+    def _sync(self, new_streams):
+        with self._lock:
+            old_names = set(stream_manager.streams.keys())
+            new_names = set(new_streams.keys())
+
+            for name in old_names - new_names:
+                with stream_manager._lock:
+                    if name in stream_manager.streams:
+                        stream_manager.stop_stream(name)
+                        del stream_manager.streams[name]
+                logger.info(f"INI watcher: stream '{name}' eliminado del INI, detenido")
+
+            for name in new_names - old_names:
+                stream_manager.register_stream(name, new_streams[name])
+                if new_streams[name].get("autostart") or START_ALL_ON_BOOT:
+                    stream_manager.start_stream(name)
+                    logger.info(f"INI watcher: stream '{name}' añadido y arrancado")
+                else:
+                    logger.info(f"INI watcher: stream '{name}' añadido (autostart=false)")
+
+
 if __name__ == "__main__":
     if "--init" in sys.argv:
         migrated = migrate_root_to_db()
@@ -1073,6 +1159,10 @@ if __name__ == "__main__":
     monitor.start()
     scheduler.start()
     print("Monitor y scheduler iniciados")
+
+    ini_watcher = IniChangeWatcher()
+    ini_watcher.start()
+    print("INI watcher iniciado")
 
     try:
         app.run(host="0.0.0.0", port=5006, debug=False, threaded=True)

@@ -179,6 +179,7 @@ def load_deployment_overrides(ini_path=None, content=None):
         "midnight_restart": None,
         "auto_restart": None,
         "start_all_on_boot": None,
+        "service": None,
     }
     try:
         if content is not None:
@@ -196,6 +197,8 @@ def load_deployment_overrides(ini_path=None, content=None):
             out["title"] = s.get("Title", "").strip() or None
         if "Network" in s:
             out["network"] = s.get("Network", "").strip() or None
+        if "Service" in s:
+            out["service"] = s.get("Service", "").strip() or None
         for ini_key, out_key in [
             ("Night_Restart", "midnight_restart"),
             ("Auto_Restart", "auto_restart"),
