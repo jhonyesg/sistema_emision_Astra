@@ -2,15 +2,21 @@ import configparser
 import os
 
 
+def _make_parser():
+    # interpolation=None: los % en URLs codificadas (%C3%B3n, etc.) rompen
+    # la interpolación por defecto de configparser.
+    return configparser.ConfigParser(interpolation=None)
+
+
 class ConfigParser:
     def __init__(self, ini_path=None, content=None):
         if content is not None:
             self.ini_path = None
-            self.config = configparser.ConfigParser()
+            self.config = _make_parser()
             self.config.read_string(content)
         else:
             self.ini_path = ini_path
-            self.config = configparser.ConfigParser()
+            self.config = _make_parser()
             self.config.read(ini_path, encoding="utf-8")
 
     def get_all_streams(self):
@@ -34,6 +40,14 @@ class ConfigParser:
                 "vaapi_driver": self._get_value(section, "VAAPI_DRIVER")
                 or self._get_value(section, "vaapi_driver")
                 or "",
+                # DECODER=nvidia: la decodificacion y el escalado se hacen en la
+                # GPU NVIDIA (NVDEC + scale_cuda) y solo el encode queda en la
+                # iGPU. Requiere driver NVIDIA con persistence mode activo.
+                "decoder": (
+                    self._get_value(section, "DECODER")
+                    or self._get_value(section, "decoder")
+                    or ""
+                ).lower(),
                 "vlc_transcode": self._get_value(section, "VLC_TRANSCODE")
                 or self._get_value(section, "vlc_transcode")
                 or "",
@@ -183,10 +197,10 @@ def load_deployment_overrides(ini_path=None, content=None):
     }
     try:
         if content is not None:
-            cp = configparser.ConfigParser()
+            cp = _make_parser()
             cp.read_string(content)
         elif ini_path and os.path.isfile(ini_path):
-            cp = configparser.ConfigParser()
+            cp = _make_parser()
             cp.read(ini_path, encoding="utf-8")
         else:
             return out

@@ -95,9 +95,9 @@ async def main():
         await page.wait_for_selector("#details-modal", state="visible", timeout=5000)
         await page.locator(".tab-btn", has_text="Comando").click()
         await page.wait_for_timeout(800)
-        # Redact the Original URL field if the open stream happens to be
-        # Telemedellín (public SRT host + passphrase). Keep all other streams
-        # untouched because they only expose LAN IPs.
+        # Redact the Original URL field when the open stream uses a public SRT
+        # source (host + passphrase). Keep all other streams untouched because
+        # they only expose LAN IPs.
         await page.evaluate(
             """
             () => {
@@ -108,7 +108,7 @@ async def main():
                     for (const s of strongs) {
                         if (s.textContent.trim().toLowerCase().startsWith('original')) {
                             const code = s.parentElement.querySelector('code');
-                            if (code && /midecotv\\.ddns\\.net|passphrase=/.test(code.textContent)) {
+                            if (code && /srt:\\/\\/.+\\?.*passphrase=/.test(code.textContent)) {
                                 code.textContent = 'srt://<dominio-p\u00fablico>:<puerto>?passphrase=**********';
                                 code.style.color = '#888';
                                 code.style.textDecoration = 'line-through';
@@ -127,10 +127,10 @@ async def main():
                 }
                 // 2) Raw ffmpeg command box at the top of the modal.
                 const cmd = document.getElementById('cmd-content');
-                if (cmd && /midecotv\\.ddns\\.net/.test(cmd.textContent)) {
+                if (cmd && /srt:\\/\\//.test(cmd.textContent)) {
                     const masked = cmd.textContent.replace(
-                        /srt:\\/\\/midecotv\\.ddns\\.net:\\d+\\?passphrase=[^&\\s"]+/,
-                        'srt://<dominio-p\u00fablico>:<puerto>?passphrase=**********'
+                        /srt:\\/\\/[^\\s"']+:\\d+\\?[^\\s"']*passphrase=[^&\\s"']+/,
+                        'srt://<dominio-publico>:<puerto>?passphrase=**********'
                     );
                     cmd.textContent = masked;
                     cmd.style.textDecoration = 'line-through';
@@ -172,11 +172,11 @@ async def main():
         await page.locator("button", has_text="📝 INI").click()
         await page.wait_for_selector("#ini-modal", timeout=5000)
         await page.wait_for_function(
-            "document.getElementById('ini-content').value.includes('[01_Telemedellin]')",
+            "document.getElementById('ini-content').value.includes('Original_URL=srt://')",
             timeout=5000,
         )
         await page.wait_for_timeout(400)
-        # Redact the Telemedellín Original_URL (public SRT host) in-place so the
+        # Redact any public SRT Original_URL (host + passphrase) in-place so the
         # screenshot never shows the real domain / passphrase. The screenshot
         # script never POSTs anything back, this only edits the DOM textarea
         # for the documentation capture.
@@ -185,7 +185,7 @@ async def main():
             () => {
                 const ta = document.getElementById('ini-content');
                 const lines = ta.value.split('\\n');
-                const idx = lines.findIndex(l => l.includes('[01_Telemedellin]'));
+                const idx = lines.findIndex(l => l.includes('Original_URL=srt://'));
                 if (idx === -1) return;
                 // Replace only the long public-domain URL with a short placeholder
                 // so it fits on a single line in the screenshot.

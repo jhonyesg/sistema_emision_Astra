@@ -8,9 +8,14 @@ venv/
 
 # Secrets / runtime config
 config.json
+# Config por instancia (mismo criterio que config.json)
+config.*.json
+# Tokens de API: uno por instancia (.api_token.<instancia>), nunca en git
+.api_token.*
 cadena_rcn.ini
 *.bak
 *.bak.*
+*.bak-*
 *~
 .env
 .env.*
@@ -19,11 +24,37 @@ cadena_rcn.ini
 db/*.ini
 db/*.ini.bak
 
+# Copias de seguridad locales (contienen codigo y configs del host)
+backups/
+
+# Config local de sincronizacion
+.syncthing.config.json.tmp
+
+# Capturas sueltas en la raiz
+/1
+
+# Auditoria de infraestructura del host (IPs, discos, SMART, topologia)
+# Es informacion sensible del cliente: se queda fuera del repo publico.
+docs/PLAN_OPTIMIZACION_SERVIDOR_*.md
+
+# Documentacion que incluye datos del cliente (lineup de canales y URLs de
+# origen). No se puede redactar de forma fiable: se queda en el host.
+docs/DIAGNOSTICO_STREAMS.md
+docs/PLAN_ESTABILIDAD.md
+docs/lecciones/
+
+# Script de puente de un canal concreto del cliente (no es parte de la app)
+preproc-*.sh
+
 # Tooling state
 .claude/
 .kilo/
+.kilocode/
 .idea/
 .vscode/
+
+# Grabaciones de prueba
+grabacion_test*.flv
 
 # OS
 .DS_Store

@@ -20,6 +20,7 @@ app = Flask(__name__)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from api_auth import ApiAuth
 from config_parser import load_config, load_config_from_content, load_deployment_overrides
 from monitor import monitor
 from stream_manager import stream_manager
@@ -163,8 +164,29 @@ def _validate_config_name(name):
         return None
     return safe
 
-NET_INTERFACE = "enp2s0"
 _DEFAULT_NET_INTERFACE = "enp2s0"
+
+
+def _detect_primary_interface():
+    """Detecta la interfaz con la ruta por defecto (la que sale a Internet).
+
+    Los INI traian 'Network=enp4s0', una interfaz que no existe en este
+    host: las metricas de red del panel salian en 0.0 Mbps.
+    """
+    try:
+        out = subprocess.run(
+            ["ip", "route", "get", "8.8.8.8"],
+            capture_output=True, text=True, timeout=3,
+        )
+        m = re.search(r"\bdev\s+(\S+)", out.stdout or "")
+        if m and m.group(1) in psutil.net_io_counters(pernic=True):
+            return m.group(1)
+    except Exception:
+        pass
+    return _DEFAULT_NET_INTERFACE
+
+
+NET_INTERFACE = _detect_primary_interface()
 
 
 def _apply_deployment_overrides():
@@ -182,7 +204,14 @@ def _apply_deployment_overrides():
         PLATFORM_TITLE = overrides["title"]
         app_config["platform_title"] = PLATFORM_TITLE
     if overrides.get("network"):
-        NET_INTERFACE = overrides["network"]
+        requested = overrides["network"]
+        if requested in psutil.net_io_counters(pernic=True):
+            NET_INTERFACE = requested
+        else:
+            logger.warning(
+                "Network=%s no existe en este host; se usa la interfaz detectada (%s).",
+                requested, NET_INTERFACE,
+            )
     if overrides.get("service"):
         SERVICE_NAME = overrides["service"]
     for key in ("start_all_on_boot", "midnight_restart", "auto_restart"):
@@ -250,6 +279,23 @@ def get_system_stats():
     }
 
 
+def _instance_config_path():
+    """Ruta del config.json PROPIO de esta instancia.
+
+    config.json es compartido por 112_A (5006) y 112_B (5007): un toggle
+    de un panel afectaba al otro. Ahora cada instancia tiene su propio
+    config.<ini>.json que se superpone al base.
+    """
+    ini = os.environ.get("ASTRA_INI", "")
+    stem = os.path.splitext(os.path.basename(ini))[0] if ini else ""
+    if not stem:
+        return CONFIG_FILE
+    return os.path.join(os.path.dirname(CONFIG_FILE) or ".", f"config.{stem}.json")
+
+
+INSTANCE_CONFIG_FILE = _instance_config_path()
+
+
 def load_app_config():
     defaults = {
         "start_all_on_boot": True,
@@ -257,27 +303,29 @@ def load_app_config():
         "auto_restart": True,
         "platform_title": _DEFAULT_TITLE,
     }
-    try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            if isinstance(cfg, dict):
-                defaults.update(cfg)
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning(f"No se pudo cargar {CONFIG_FILE}: {e}")
+    for path in (CONFIG_FILE, INSTANCE_CONFIG_FILE):
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                if isinstance(cfg, dict):
+                    defaults.update(cfg)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"No se pudo cargar {path}: {e}")
     return defaults
 
 
 def save_app_config(config):
-    """Escribe config.json con escritura atómica tmp + rename."""
-    config_dir = os.path.dirname(CONFIG_FILE) or "."
+    """Escribe el config.json de la instancia con escritura atomica tmp+rename."""
+    target = INSTANCE_CONFIG_FILE
+    config_dir = os.path.dirname(target) or "."
     fd, tmp_path = tempfile.mkstemp(prefix=".config-", dir=config_dir, suffix=".json")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, CONFIG_FILE)
+        os.replace(tmp_path, target)
     except Exception:
         try:
             os.unlink(tmp_path)
@@ -295,6 +343,13 @@ SERVICE_NAME = ""
 _CONFIG_LOCK = threading.Lock()
 
 _apply_deployment_overrides()
+
+# Persiste los overrides de [servidor] del INI en el config de la instancia
+# para que el monitor y el resto de componentes los vean igual.
+try:
+    save_app_config(app_config)
+except Exception as e:
+    logger.warning(f"No se pudo persistir el config de instancia: {e}")
 
 
 class MidnightRestartScheduler:
@@ -352,8 +407,30 @@ def initialize_streams():
         stream_manager.register_stream(name, stream_config)
         if stream_config.get("autostart") or START_ALL_ON_BOOT:
             stream_manager.start_stream(name)
-            time.sleep(2)
+            # Antes: time.sleep(2) por stream (25 streams = 50 s de panel
+            # caido). Ahora el arranque va en un hilo aparte y el panel esta
+            # disponible de inmediato; aqui solo se escalona ligeramente.
+            time.sleep(0.5)
     return len(streams)
+
+
+# El INI watcher no debe sincronizar hasta que el bootstrap inicial haya
+# registrado todos los streams: si no, ve un manager a medias, da de alta
+# streams que ya existen (start duplicado) y resetea el circuit breaker.
+BOOTSTRAP_DONE = threading.Event()
+
+
+def _bootstrap_streams_async():
+    """Arranca los streams en segundo plano para no retrasar la apertura
+    del panel (que antes tardaba ~50 s en 112_A y ~28 s en 112_B)."""
+    try:
+        count = initialize_streams()
+        active = get_active_ini_name() or "(ninguna)"
+        print(f"Loaded {count} streams from db/{active}")
+    except Exception:
+        logger.exception("Error arrancando los streams al inicio")
+    finally:
+        BOOTSTRAP_DONE.set()
 
 
 # Import lazy de markdown para que /help no penalice el arranque
@@ -368,9 +445,63 @@ def _get_markdown():
     return _markdown_module
 
 
+
+# ----------------------------------------------------------------------
+# Autenticacion de la API (ver api_auth.py)
+# ----------------------------------------------------------------------
+api_auth = ApiAuth(app_config, BASE_DIR)
+# El token se genera al arrancar: debe existir siempre (el watchdog y los
+# operadores lo necesitan) aunque nadie haya abierto la pagina.
+api_auth.token()
+
+
+@app.before_request
+def _api_access_guard():
+    if not request.path.startswith("/api/"):
+        return None
+    provided = request.headers.get("X-Astra-Token") or request.args.get("token", "")
+    denied = api_auth.check(
+        request.path, request.method, request.remote_addr, provided
+    )
+    if denied:
+        payload, code = denied
+        return jsonify(payload), code
+    return None
+
+
+
+def _service_exists(service_name):
+    """True si la unidad systemd existe realmente en este host.
+
+    Los INIs de otros nodos (131, 138) declaran Service= con unidades que
+    no existen aqui: el boton 'Reiniciar plataforma' fallaba en silencio.
+    """
+    if not service_name:
+        return False
+    try:
+        out = subprocess.run(
+            ["systemctl", "show", "-p", "LoadState", "--value", service_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip() == "loaded"
+    except Exception:
+        return False
+
+
 @app.route("/")
 def index():
-    return render_template("index.html", platform_title=PLATFORM_TITLE)
+    # Token: desde IP de confianza o via ?token=... (por si el operador
+    # entra desde otra IP).
+    _token = ""
+    if api_auth.is_trusted(request.remote_addr):
+        _token = api_auth.token()
+    else:
+        _provided = request.args.get("token", "")
+        if api_auth.token_ok(_provided):
+            _token = api_auth.token()
+    return render_template(
+        "index.html", platform_title=PLATFORM_TITLE, astra_token=_token
+    )
 
 
 @app.route("/help")
@@ -569,6 +700,7 @@ def stream_update(name):
         "Original_URL", "Destination_URL", "FFMPEG_PATH",
         "FFMPEG_PRE_OPTIONS", "FFMPEG_POST_OPTIONS",
         "VAAPI_DRIVER", "VLC_TRANSCODE", "VLC_PORT", "autostart",
+        "DECODER",
     }
     updates = {k: v for k, v in data.items() if k in allowed_keys}
 
@@ -646,15 +778,24 @@ def get_logs(name):
 def get_command(name):
     if name in stream_manager.streams:
         stream = stream_manager.streams[name]
-        cmd = stream.build_ffmpeg_command(stream._vlc_url if stream._vlc_process else None)
-        quoted_cmd = []
-        for arg in cmd:
-            if "://" in arg or arg.startswith("rtmp") or "(" in arg or ")" in arg:
-                quoted_cmd.append(f'"{arg}"')
-            else:
-                quoted_cmd.append(arg)
+        cmds = stream.build_ffmpeg_commands(
+            stream._vlc_url if stream._vlc_process else None
+        )
+        quoted_cmds = []
+        for cmd in cmds:
+            quoted_cmd = []
+            for arg in cmd:
+                if "://" in arg or arg.startswith("rtmp") or "(" in arg or ")" in arg:
+                    quoted_cmd.append(f'"{arg}"')
+                else:
+                    quoted_cmd.append(arg)
+            quoted_cmds.append(" ".join(quoted_cmd))
         return jsonify(
-            {"name": name, "command": " ".join(quoted_cmd), "config": stream.config}
+            {
+                "name": name,
+                "command": "\n# ETAPA 2 (encode)\n".join(quoted_cmds),
+                "config": stream.config,
+            }
         )
     return jsonify({"error": "Stream not found"}), 404
 
@@ -677,11 +818,11 @@ def stop_all():
 
 @app.route("/api/restart_platform", methods=["POST"])
 def restart_platform():
-    if SERVICE_NAME:
+    if SERVICE_NAME and _service_exists(SERVICE_NAME):
         logger.info(f"Reiniciando servicio systemd: {SERVICE_NAME}")
         try:
             subprocess.Popen(
-                ["sudo", "-n", "systemctl", "restart", SERVICE_NAME],
+                ["sudo", "-n", "systemctl", "restart", "--no-block", SERVICE_NAME],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
@@ -689,9 +830,12 @@ def restart_platform():
         except Exception:
             logger.exception("Error lanzando systemctl restart")
             return jsonify({"success": False, "error": "No se pudo lanzar systemctl"}), 500
-        time.sleep(0.5)
-        os._exit(0)
-        return jsonify({"success": True, "method": "systemd", "service": SERVICE_NAME})
+        return jsonify({
+            "success": True,
+            "method": "systemd",
+            "service": SERVICE_NAME,
+            "note": "Reinicio programado; el servidor se detendra en breve",
+        })
 
     restart_script = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "restart_platform.sh"
@@ -712,7 +856,12 @@ def restart_platform():
         start_new_session=True,
     )
 
-    os._exit(0)
+    return jsonify({
+        "success": True,
+        "method": "script",
+        "script": restart_script,
+        "note": "Reinicio en curso",
+    })
 
 
 @app.route("/api/ini/read", methods=["GET"])
@@ -1087,6 +1236,11 @@ class IniChangeWatcher:
             return None
 
     def _loop(self):
+        # Espera a que el bootstrap inicial termine de registrar los streams
+        while self._running and not BOOTSTRAP_DONE.wait(timeout=1):
+            pass
+        if not self._running:
+            return
         while self._running:
             try:
                 ini_path = resolve_active_ini_path()
@@ -1116,6 +1270,11 @@ class IniChangeWatcher:
                         stream_manager.stop_stream(name)
                         del stream_manager.streams[name]
                 logger.info(f"INI watcher: stream '{name}' eliminado del INI, detenido")
+
+            # Streams que ya existen: se actualiza la config en memoria
+            # (sin reiniciar; para aplicar cambios se usa la API).
+            for name in old_names & new_names:
+                stream_manager.register_stream(name, new_streams[name])
 
             for name in new_names - old_names:
                 stream_manager.register_stream(name, new_streams[name])
@@ -1152,9 +1311,10 @@ if __name__ == "__main__":
         sys.exit(0)
 
     migrate_root_to_db()
-    count = initialize_streams()
-    active = get_active_ini_name() or "(ninguna)"
-    print(f"Loaded {count} streams from db/{active}")
+
+    # El panel se abre YA; los streams arrancan en paralelo (antes el panel
+    # tardaba ~50 s en abrir porque initialize_streams() corria antes).
+    threading.Thread(target=_bootstrap_streams_async, daemon=True).start()
 
     monitor.start()
     scheduler.start()
@@ -1165,7 +1325,8 @@ if __name__ == "__main__":
     print("INI watcher iniciado")
 
     try:
-        app.run(host="0.0.0.0", port=5006, debug=False, threaded=True)
+        _port = int(os.environ.get("ASTRA_PORT", "5006"))
+        app.run(host="0.0.0.0", port=_port, debug=False, threaded=True)
     finally:
         scheduler._running = False
         monitor.stop()

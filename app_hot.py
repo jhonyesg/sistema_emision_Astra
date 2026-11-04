@@ -1,0 +1,1320 @@
+import configparser
+import gc
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+
+import psutil
+from flask import Flask, jsonify, render_template, render_template_string, request
+
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from api_auth import ApiAuth
+from config_parser import load_config, load_config_from_content, load_deployment_overrides
+from monitor import monitor
+from stream_manager import stream_manager
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_DIR = os.path.join(BASE_DIR, "db")
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+
+
+def list_db_configs():
+    """Devuelve [(name, full_path, size, mtime)] ordenados alfabéticamente."""
+    if not os.path.isdir(DB_DIR):
+        return []
+    out = []
+    for name in sorted(os.listdir(DB_DIR)):
+        if not name.lower().endswith(".ini"):
+            continue
+        full = os.path.join(DB_DIR, name)
+        if not os.path.isfile(full):
+            continue
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        out.append((name, full, st.st_size, int(st.st_mtime)))
+    return out
+
+
+def count_streams_in_ini(path):
+    if not path or not os.path.isfile(path):
+        return 0
+    n = 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s.startswith("[") or not s.endswith("]"):
+                    continue
+                if s[1:-1].lower() == "servidor":
+                    continue
+                n += 1
+    except OSError:
+        return 0
+    return n
+
+
+def find_db_config(name):
+    """Resuelve un nombre de config dentro de db/ con guardas de seguridad. Acepta nombres con o sin `.ini`."""
+    if not name:
+        return None
+    name = name.strip()
+    if "/" in name or "\\" in name or name.startswith("."):
+        return None
+    safe = os.path.basename(name)
+    if not safe.lower().endswith(".ini"):
+        safe = safe + ".ini"
+    return os.path.join(DB_DIR, safe)
+
+
+def resolve_active_ini_path():
+    """Resuelve el INI activo siguiendo la prioridad ASTRA_INI > config.json > primer archivo en db/ > legacy raíz."""
+    # 1) variable de entorno (override de despliegue)
+    env = (os.environ.get("ASTRA_INI") or "").strip()
+    if env:
+        return env if os.path.isabs(env) else os.path.join(BASE_DIR, env)
+    # 2) config.json > active_config
+    cfg = load_app_config()
+    stored = (cfg.get("active_config") or "").strip()
+    if stored:
+        candidate = stored if os.path.isabs(stored) else os.path.join(BASE_DIR, stored)
+        if os.path.isfile(candidate):
+            return candidate
+    # 3) primer *.ini alfabético dentro de db/
+    if os.path.isdir(DB_DIR):
+        for n in sorted(os.listdir(DB_DIR)):
+            if n.lower().endswith(".ini"):
+                full = os.path.join(DB_DIR, n)
+                if os.path.isfile(full):
+                    return full
+    # 4) legacy: cadena_rcn.ini en la raíz
+    legacy = os.path.join(BASE_DIR, "cadena_rcn.ini")
+    if os.path.isfile(legacy):
+        return legacy
+    return None
+
+
+def get_active_ini_name():
+    p = resolve_active_ini_path()
+    return os.path.basename(p) if p else None
+
+
+def migrate_root_to_db():
+    """Si existe cadena_rcn.ini en la raíz y db/ está vacío, lo mueve y persiste el activo."""
+    legacy = os.path.join(BASE_DIR, "cadena_rcn.ini")
+    if not os.path.isfile(legacy):
+        return None
+    os.makedirs(DB_DIR, exist_ok=True)
+    existing = [n for n in os.listdir(DB_DIR) if n.lower().endswith(".ini")]
+    if existing:
+        return None
+    for i in range(1, 1000):
+        target = os.path.join(DB_DIR, f"{i}_default.ini")
+        if not os.path.exists(target):
+            target_name = os.path.basename(target)
+            break
+    else:
+        return None
+    try:
+        os.replace(legacy, os.path.join(DB_DIR, target_name))
+    except OSError as e:
+        logger.warning(f"No se pudo migrar {legacy}: {e}")
+        return None
+    backup = legacy + ".bak"
+    if os.path.exists(backup):
+        try:
+            os.replace(backup, os.path.join(DB_DIR, target_name + ".bak"))
+        except OSError:
+            pass
+    cfg = load_app_config()
+    cfg["active_config"] = f"db/{target_name}"
+    try:
+        save_app_config(cfg)
+    except OSError as e:
+        logger.warning(f"No se pudo guardar active_config: {e}")
+    return target_name
+
+
+def _validate_config_name(name):
+    """Devuelve un nombre .ini saneado o None si es inválido."""
+    if not isinstance(name, str):
+        return None
+    name = name.strip()
+    if not name:
+        return None
+    if "/" in name or "\\" in name or name.startswith("."):
+        return None
+    if not name.lower().endswith(".ini"):
+        name = name + ".ini"
+    safe = os.path.basename(name)
+    if safe != name:
+        return None
+    return safe
+
+_DEFAULT_NET_INTERFACE = "enp2s0"
+
+
+def _detect_primary_interface():
+    """Detecta la interfaz con la ruta por defecto (la que sale a Internet)."""
+    try:
+        out = subprocess.run(
+            ["ip", "route", "get", "8.8.8.8"],
+            capture_output=True, text=True, timeout=3,
+        )
+        m = re.search(r"\bdev\s+(\S+)", out.stdout or "")
+        if m and m.group(1) in psutil.net_io_counters(pernic=True):
+            return m.group(1)
+    except Exception:
+        pass
+    return _DEFAULT_NET_INTERFACE
+
+
+NET_INTERFACE = _detect_primary_interface()
+
+
+def _apply_deployment_overrides():
+    """Lee [servidor] del INI activo y sobreescribe Title/Network/toggles.
+    Se llama al arranque y cada vez que se activa una config nueva.
+    """
+    global PLATFORM_TITLE, NET_INTERFACE, SERVICE_NAME
+    global START_ALL_ON_BOOT, MIDNIGHT_RESTART_ENABLED, AUTO_RESTART_ENABLED
+    try:
+        overrides = load_deployment_overrides(resolve_active_ini_path())
+    except Exception as e:
+        logger.warning(f"No se pudieron aplicar overrides de despliegue: {e}")
+        return
+    if overrides.get("title"):
+        PLATFORM_TITLE = overrides["title"]
+        app_config["platform_title"] = PLATFORM_TITLE
+    if overrides.get("network"):
+        requested = overrides["network"]
+        if requested in psutil.net_io_counters(pernic=True):
+            NET_INTERFACE = requested
+        else:
+            logger.warning(
+                "Network=%s no existe en este host; se usa la interfaz detectada (%s).",
+                requested, NET_INTERFACE,
+            )
+    if overrides.get("service"):
+        SERVICE_NAME = overrides["service"]
+    for key in ("start_all_on_boot", "midnight_restart", "auto_restart"):
+        if overrides.get(key) is not None:
+            val = bool(overrides[key])
+            app_config[key] = val
+            if key == "start_all_on_boot":
+                START_ALL_ON_BOOT = val
+            elif key == "midnight_restart":
+                MIDNIGHT_RESTART_ENABLED = val
+            elif key == "auto_restart":
+                AUTO_RESTART_ENABLED = val
+    try:
+        _NET_PREV["time"] = time.time()
+        cnt = psutil.net_io_counters(pernic=True).get(NET_INTERFACE)
+        if cnt:
+            _NET_PREV["bytes_sent"] = cnt.bytes_sent
+            _NET_PREV["bytes_recv"] = cnt.bytes_recv
+    except Exception:
+        pass
+_NET_LOCK = threading.Lock()
+_NET_PREV = {"time": time.time(), "bytes_sent": 0, "bytes_recv": 0}
+_net_counters = psutil.net_io_counters(pernic=True).get(NET_INTERFACE)
+if _net_counters:
+    _NET_PREV["bytes_sent"] = _net_counters.bytes_sent
+    _NET_PREV["bytes_recv"] = _net_counters.bytes_recv
+
+# Inicializar cpu_percent para que el primer get no devuelva 0.0
+psutil.cpu_percent(interval=None)
+
+_DEFAULT_TITLE = "Sistema de Emisión 24/7-Astra"
+_MAX_TITLE_LEN = 100
+
+_TITLE_SANITIZER = re.compile(r"[<>\"\'&]")
+
+
+def get_system_stats():
+    cpu_percent = psutil.cpu_percent(interval=None)
+    mem_percent = psutil.virtual_memory().percent
+
+    now = time.time()
+    upload_mbps = 0.0
+    download_mbps = 0.0
+    counters = psutil.net_io_counters(pernic=True).get(NET_INTERFACE)
+    if counters:
+        with _NET_LOCK:
+            dt = now - _NET_PREV["time"]
+            if dt > 0:
+                upload_mbps = max(
+                    0, (counters.bytes_sent - _NET_PREV["bytes_sent"]) * 8 / dt / 1_000_000
+                )
+                download_mbps = max(
+                    0, (counters.bytes_recv - _NET_PREV["bytes_recv"]) * 8 / dt / 1_000_000
+                )
+            _NET_PREV["time"] = now
+            _NET_PREV["bytes_sent"] = counters.bytes_sent
+            _NET_PREV["bytes_recv"] = counters.bytes_recv
+
+    return {
+        "cpu_percent": round(cpu_percent, 1),
+        "mem_percent": round(mem_percent, 1),
+        "net_interface": NET_INTERFACE,
+        "upload_mbps": round(upload_mbps, 2),
+        "download_mbps": round(download_mbps, 2),
+    }
+
+
+def _instance_config_path():
+    """Ruta del config.json PROPIO de esta instancia (config.112_b.json)."""
+    ini = os.environ.get("ASTRA_INI", "")
+    stem = os.path.splitext(os.path.basename(ini))[0] if ini else ""
+    if not stem:
+        return CONFIG_FILE
+    return os.path.join(os.path.dirname(CONFIG_FILE) or ".", f"config.{stem}.json")
+
+
+INSTANCE_CONFIG_FILE = _instance_config_path()
+
+
+def load_app_config():
+    defaults = {
+        "start_all_on_boot": True,
+        "midnight_restart": True,
+        "auto_restart": True,
+        "platform_title": _DEFAULT_TITLE,
+    }
+    for path in (CONFIG_FILE, INSTANCE_CONFIG_FILE):
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                if isinstance(cfg, dict):
+                    defaults.update(cfg)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"No se pudo cargar {path}: {e}")
+    return defaults
+
+
+def save_app_config(config):
+    """Escribe el config.json de la instancia con escritura atomica tmp+rename."""
+    target = INSTANCE_CONFIG_FILE
+    config_dir = os.path.dirname(target) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".config-", dir=config_dir, suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, target)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+app_config = load_app_config()
+START_ALL_ON_BOOT = app_config.get("start_all_on_boot", True)
+MIDNIGHT_RESTART_ENABLED = app_config.get("midnight_restart", True)
+AUTO_RESTART_ENABLED = app_config.get("auto_restart", True)
+PLATFORM_TITLE = app_config.get("platform_title", _DEFAULT_TITLE)
+SERVICE_NAME = ""
+_CONFIG_LOCK = threading.Lock()
+
+_apply_deployment_overrides()
+
+# Persiste los overrides de [servidor] del INI en el config de la instancia
+# para que el monitor y el resto de componentes los vean igual.
+try:
+    save_app_config(app_config)
+except Exception as e:
+    logger.warning(f"No se pudo persistir el config de instancia: {e}")
+
+
+class MidnightRestartScheduler:
+    def __init__(self):
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        already_executed = False
+        while self._running:
+            now = datetime.now(timezone.utc).astimezone()
+            next_midnight = (now + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            seconds_until = (next_midnight - now).total_seconds()
+            logger.info(f"Próximo reinicio a medianoche en {int(seconds_until)} segundos")
+            time.sleep(min(seconds_until, 60))
+            if not self._running:
+                break
+            now = datetime.now(timezone.utc).astimezone()
+            if not MIDNIGHT_RESTART_ENABLED:
+                if now.hour == 0 and now.minute < 5 and not already_executed:
+                    logger.info("Reinicio a medianoche deshabilitado, saltando...")
+                    already_executed = True
+                if now.hour >= 5:
+                    already_executed = False
+                continue
+            if now.hour == 0 and now.minute < 5 and not already_executed:
+                logger.info("Ejecutando reinicio completo a medianoche...")
+                stream_manager.full_restart()
+                logger.info("Reinicio completo - memoria liberada")
+                already_executed = True
+            elif now.hour >= 5:
+                already_executed = False
+
+
+scheduler = MidnightRestartScheduler()
+
+
+def initialize_streams():
+    ini_path = resolve_active_ini_path()
+    if not ini_path or not os.path.isfile(ini_path):
+        return 0
+    config = load_config(ini_path)
+    streams = config.get_all_streams()
+    for stream_config in streams:
+        name = stream_config["name"]
+        stream_manager.register_stream(name, stream_config)
+        if stream_config.get("autostart") or START_ALL_ON_BOOT:
+            stream_manager.start_stream(name)
+            # Antes: time.sleep(2) por stream (14 streams = 28 s de panel
+            # caido). El arranque va en un hilo aparte.
+            time.sleep(0.5)
+    return len(streams)
+
+
+# El INI watcher no debe sincronizar hasta que el bootstrap inicial haya
+# registrado todos los streams: si no, ve un manager a medias, da de alta
+# streams que ya existen (start duplicado) y resetea el circuit breaker.
+BOOTSTRAP_DONE = threading.Event()
+
+
+def _bootstrap_streams_async():
+    """Arranca los streams en segundo plano para no retrasar la apertura
+    del panel."""
+    try:
+        count = initialize_streams()
+        active = get_active_ini_name() or "(ninguna)"
+        print(f"Loaded {count} streams from db/{active}")
+    except Exception:
+        logger.exception("Error arrancando los streams al inicio")
+    finally:
+        BOOTSTRAP_DONE.set()
+
+
+# Import lazy de markdown para que /help no penalice el arranque
+_markdown_module = None
+
+
+def _get_markdown():
+    global _markdown_module
+    if _markdown_module is None:
+        import markdown as _md
+        _markdown_module = _md
+    return _markdown_module
+
+
+
+# ----------------------------------------------------------------------
+# Autenticacion de la API (ver api_auth.py)
+# ----------------------------------------------------------------------
+api_auth = ApiAuth(app_config, BASE_DIR)
+# El token se genera al arrancar: debe existir siempre (el watchdog y los
+# operadores lo necesitan) aunque nadie haya abierto la pagina.
+api_auth.token()
+
+
+@app.before_request
+def _api_access_guard():
+    if not request.path.startswith("/api/"):
+        return None
+    provided = request.headers.get("X-Astra-Token") or request.args.get("token", "")
+    denied = api_auth.check(
+        request.path, request.method, request.remote_addr, provided
+    )
+    if denied:
+        payload, code = denied
+        return jsonify(payload), code
+    return None
+
+
+
+def _service_exists(service_name):
+    """True si la unidad systemd existe realmente en este host.
+
+    Los INIs de otros nodos (131, 138) declaran Service= con unidades que
+    no existen aqui: el boton 'Reiniciar plataforma' fallaba en silencio.
+    """
+    if not service_name:
+        return False
+    try:
+        out = subprocess.run(
+            ["systemctl", "show", "-p", "LoadState", "--value", service_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip() == "loaded"
+    except Exception:
+        return False
+
+
+@app.route("/")
+def index():
+    # Token: desde IP de confianza o via ?token=... (por si el operador
+    # entra desde otra IP).
+    _token = ""
+    if api_auth.is_trusted(request.remote_addr):
+        _token = api_auth.token()
+    else:
+        _provided = request.args.get("token", "")
+        if api_auth.token_ok(_provided):
+            _token = api_auth.token()
+    return render_template(
+        "index.html", platform_title=PLATFORM_TITLE, astra_token=_token
+    )
+
+
+@app.route("/help")
+def help():
+    readme_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md")
+    try:
+        with open(readme_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        md = _get_markdown()
+        html_content = md.markdown(content, extensions=["tables", "fenced_code"])
+        return render_template_string('''
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Documentación - Sistema de Emisión</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+        h1 { color: #1e1e2f; border-bottom: 2px solid #667eea; padding-bottom: 10px; }
+        h2 { color: #2d2d44; margin-top: 30px; border-bottom: 1px solid #ddd; padding-bottom: 5px; }
+        h3 { color: #495057; }
+        code { background: #1e1e2f; color: #00ff88; padding: 2px 6px; border-radius: 4px; font-family: 'Courier New', monospace; font-size: 0.9em; }
+        pre { background: #1e1e2f; color: #00ff88; padding: 15px; border-radius: 8px; overflow-x: auto; font-size: 0.85em; }
+        table { border-collapse: collapse; width: 100%; margin: 15px 0; }
+        th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
+        th { background: #667eea; color: white; }
+        tr:nth-child(even) { background: #f9f9f9; }
+        a { color: #667eea; }
+        .container { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        ''' + html_content + '''
+    </div>
+</body>
+</html>
+        ''')
+    except FileNotFoundError:
+        return "README.md no encontrado", 404
+    except Exception as e:
+        logger.exception("Error leyendo README")
+        return f"Error reading README: {e}", 500
+
+
+@app.route("/api/status")
+def get_status():
+    all_status = stream_manager.get_all_status()
+    running_count = stream_manager.get_running_count()
+    total_streams = len(all_status)
+
+    return jsonify(
+        {
+            "streams": all_status,
+            "summary": {
+                "total": total_streams,
+                "running": running_count,
+                "stopped": total_streams - running_count,
+                "all_running": running_count == total_streams and total_streams > 0,
+            },
+            "system": get_system_stats(),
+        }
+    )
+
+
+@app.route("/api/stream/<name>/start", methods=["POST"])
+def start_stream(name):
+    success = stream_manager.start_stream(name)
+    return jsonify({"success": success, "name": name})
+
+
+@app.route("/api/stream/<name>/stop", methods=["POST"])
+def stop_stream(name):
+    success = stream_manager.stop_stream(name)
+    return jsonify({"success": success, "name": name})
+
+
+@app.route("/api/stream/<name>/restart", methods=["POST"])
+def restart_stream(name):
+    success = stream_manager.restart_stream(name)
+    return jsonify({"success": success, "name": name})
+
+
+_AUDIO_PROBE_CACHE = {}
+_AUDIO_PROBE_TTL = 300
+
+
+def _probe_audio_codec(url, timeout=5):
+    """Devuelve dict con codec, sample_rate, channels, needs_vlc o None si falla."""
+    try:
+        cmd = [
+            "/usr/bin/ffprobe", "-hide_banner", "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=codec_name,sample_rate,channels",
+            "-of", "json",
+            "-timeout", str(timeout * 1000000),
+            url,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+        if r.returncode != 0:
+            return {"codec": "unknown", "sample_rate": None, "channels": None,
+                    "needs_vlc": False, "error": r.stderr.strip()[:200] or "ffprobe failed"}
+        import json as _json
+        data = _json.loads(r.stdout or "{}")
+        streams = data.get("streams") or []
+        if not streams:
+            return {"codec": "no_audio", "sample_rate": None, "channels": None,
+                    "needs_vlc": False, "error": "no audio stream"}
+        s = streams[0]
+        codec = s.get("codec_name", "unknown")
+        sample_rate = s.get("sample_rate")
+        channels = s.get("channels")
+        needs_vlc = (
+            codec in ("ac3", "eac3")
+            and (not sample_rate or sample_rate == "0"
+                 or not channels or int(channels or 0) <= 0)
+        )
+        return {
+            "codec": codec,
+            "sample_rate": sample_rate,
+            "channels": channels,
+            "needs_vlc": needs_vlc,
+        }
+    except subprocess.TimeoutExpired:
+        return {"codec": "timeout", "sample_rate": None, "channels": None,
+                "needs_vlc": False, "error": "ffprobe timeout"}
+    except (OSError, ValueError) as e:
+        return {"codec": "error", "sample_rate": None, "channels": None,
+                "needs_vlc": False, "error": str(e)[:200]}
+
+
+@app.route("/api/audio-probe/<name>")
+def audio_probe(name):
+    stream = stream_manager.streams.get(name)
+    if not stream:
+        return jsonify({"success": False, "error": "Stream no encontrado"}), 404
+    url = stream.config.get("original_url")
+    if not url:
+        return jsonify({"success": False, "error": "Sin Original_URL"}), 400
+
+    now = time.time()
+    cached = _AUDIO_PROBE_CACHE.get(name)
+    if cached and (now - cached["ts"]) < _AUDIO_PROBE_TTL:
+        return jsonify({"success": True, "cached": True, **cached["data"]})
+
+    result = _probe_audio_codec(url)
+    _AUDIO_PROBE_CACHE[name] = {"ts": now, "data": result}
+    return jsonify({"success": True, "cached": False, **result})
+
+
+@app.route("/api/audio-probe-batch")
+def audio_probe_batch():
+    out = {}
+    for name in list(stream_manager.streams.keys()):
+        stream = stream_manager.streams.get(name)
+        if not stream:
+            continue
+        url = stream.config.get("original_url")
+        if not url:
+            out[name] = {"codec": "unknown", "needs_vlc": False, "error": "no url"}
+            continue
+        now = time.time()
+        cached = _AUDIO_PROBE_CACHE.get(name)
+        if cached and (now - cached["ts"]) < _AUDIO_PROBE_TTL:
+            out[name] = {**cached["data"], "cached": True}
+        else:
+            result = _probe_audio_codec(url)
+            _AUDIO_PROBE_CACHE[name] = {"ts": now, "data": result}
+            out[name] = {**result, "cached": False}
+    return jsonify({"success": True, "probes": out})
+
+
+@app.route("/api/stream/<name>/vlc-status")
+def vlc_status(name):
+    s = stream_manager.get_vlc_status(name)
+    if s is None:
+        return jsonify({"success": False, "error": "Stream no encontrado"}), 404
+    return jsonify({"success": True, "name": name, **s})
+
+
+@app.route("/api/stream/<name>/vlc/restart", methods=["POST"])
+def vlc_restart(name):
+    ok, msg = stream_manager.restart_vlc_only(name)
+    return jsonify({"success": ok, "name": name, "message": msg})
+
+
+@app.route("/api/stream/<name>/update", methods=["POST"])
+def stream_update(name):
+    from config_parser import update_stream_section
+    if name not in stream_manager.streams:
+        return jsonify({"success": False, "error": "Stream no registrado"}), 404
+
+    data = request.json or {}
+    allowed_keys = {
+        "Original_URL", "Destination_URL", "FFMPEG_PATH",
+        "FFMPEG_PRE_OPTIONS", "FFMPEG_POST_OPTIONS",
+        "VAAPI_DRIVER", "VLC_TRANSCODE", "VLC_PORT", "autostart",
+        "DECODER",
+    }
+    updates = {k: v for k, v in data.items() if k in allowed_keys}
+
+    vlc_trans = updates.get("VLC_TRANSCODE")
+    if "VLC_TRANSCODE" in updates:
+        if isinstance(vlc_trans, str) and vlc_trans.strip() == "":
+            updates["VLC_TRANSCODE"] = ""
+            updates["VLC_PORT"] = ""
+        else:
+            if "VLC_PORT" not in updates:
+                updates["VLC_PORT"] = "0"
+
+    if "VLC_PORT" in updates:
+        vp = updates["VLC_PORT"]
+        if vp in (None, "", "0"):
+            del updates["VLC_PORT"]
+        else:
+            try:
+                port_int = int(vp)
+            except (TypeError, ValueError):
+                return jsonify({"success": False,
+                                "error": "VLC_PORT inválido"}), 400
+            if port_int < 1024 or port_int > 65535:
+                return jsonify({"success": False,
+                                "error": "VLC_PORT fuera de rango (1024-65535)"}), 400
+            if not stream_manager.is_port_free(port_int):
+                with stream_manager._lock:
+                    used = stream_manager._ports_by_owner()
+                if port_int in used and used[port_int] != name:
+                    return jsonify({"success": False,
+                                    "error": f"Puerto {port_int} ya lo usa {used[port_int]}"}), 409
+                return jsonify({"success": False,
+                                "error": f"Puerto {port_int} ocupado"}), 409
+            updates["VLC_PORT"] = str(port_int)
+
+    ini_path = resolve_active_ini_path()
+    if not ini_path or not os.path.isfile(ini_path):
+        return jsonify({"success": False, "error": "INI activo no encontrado"}), 500
+
+    ok, err, old_section = update_stream_section(ini_path, name, updates)
+    if not ok:
+        return jsonify({"success": False, "error": err}), 400
+
+    new_cfg = load_config(ini_path).get_stream_by_name(name)
+    if not new_cfg:
+        return jsonify({"success": False, "error": "Stream desapareció tras update"}), 500
+
+    was_running = stream_manager.streams[name].is_running()
+    stream_manager.register_stream(name, new_cfg)
+
+    if was_running:
+        stream_manager.stop_stream(name)
+        time.sleep(1)
+        started = stream_manager.start_stream(name)
+        if not started:
+            return jsonify({"success": True,
+                            "warning": "INI actualizado pero el stream no arrancó",
+                            "config": new_cfg}), 200
+
+    _AUDIO_PROBE_CACHE.pop(name, None)
+    return jsonify({"success": True, "name": name, "config": new_cfg})
+
+
+@app.route("/api/logs/<name>")
+def get_logs(name):
+    try:
+        lines = min(int(request.args.get("lines", 100)), 1000)
+    except (TypeError, ValueError):
+        lines = 100
+    logs = stream_manager.get_logs(name, lines)
+    return jsonify({"name": name, "logs": logs})
+
+
+@app.route("/api/stream/<name>/command")
+def get_command(name):
+    if name in stream_manager.streams:
+        stream = stream_manager.streams[name]
+        cmds = stream.build_ffmpeg_commands(
+            stream._vlc_url if stream._vlc_process else None
+        )
+        quoted_cmds = []
+        for cmd in cmds:
+            quoted_cmd = []
+            for arg in cmd:
+                if "://" in arg or arg.startswith("rtmp") or "(" in arg or ")" in arg:
+                    quoted_cmd.append(f'"{arg}"')
+                else:
+                    quoted_cmd.append(arg)
+            quoted_cmds.append(" ".join(quoted_cmd))
+        return jsonify(
+            {
+                "name": name,
+                "command": "\n# ETAPA 2 (encode)\n".join(quoted_cmds),
+                "config": stream.config,
+            }
+        )
+    return jsonify({"error": "Stream not found"}), 404
+
+
+@app.route("/api/start_all", methods=["POST"])
+def start_all():
+    results = {}
+    for name in list(stream_manager.streams):
+        results[name] = stream_manager.start_stream(name)
+    return jsonify({"success": True, "results": results})
+
+
+@app.route("/api/stop_all", methods=["POST"])
+def stop_all():
+    results = {}
+    for name in list(stream_manager.streams):
+        results[name] = stream_manager.stop_stream(name)
+    return jsonify({"success": True, "results": results})
+
+
+@app.route("/api/restart_platform", methods=["POST"])
+def restart_platform():
+    if SERVICE_NAME and _service_exists(SERVICE_NAME):
+        logger.info(f"Reiniciando servicio systemd: {SERVICE_NAME}")
+        try:
+            # --no-block: no espera al reinicio (el proceso saliente se
+            # bloquea en el restart). Antes, con 'systemctl restart' sin
+            # --no-block, el propio servicio se quedaba esperando.
+            subprocess.Popen(
+                ["sudo", "-n", "systemctl", "restart", "--no-block", SERVICE_NAME],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception:
+            logger.exception("Error lanzando systemctl restart")
+            return jsonify({"success": False, "error": "No se pudo lanzar systemctl"}), 500
+        time.sleep(0.5)
+        # Codigo de salida 1 (no 0): con Restart=on-failure systemd solo
+        # relanza el servicio si el proceso termina con error. Con os._exit(0)
+        # la instancia 5007 quedaba MUERTA de forma permanente.
+        os._exit(1)
+
+    restart_script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "restart_platform.sh"
+    )
+    if not os.path.exists(restart_script):
+        return jsonify({"success": False, "error": "restart_platform.sh not found"}), 500
+
+    try:
+        stream_manager.stop_all_and_cleanup()
+    except Exception:
+        logger.exception("Error en stop_all_and_cleanup durante restart_platform")
+
+    log_file = "/tmp/kilo/emision_app.log"
+    subprocess.Popen(
+        ["nohup", "bash", restart_script, log_file],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    # Salida con codigo 1: systemd (Restart=on-failure) debe relanzar la
+    # instancia. Con os._exit(0) la instancia quedaba muerta para siempre.
+    os._exit(1)
+
+
+@app.route("/api/ini/read", methods=["GET"])
+def read_ini():
+    ini_path = resolve_active_ini_path()
+    if not ini_path or not os.path.isfile(ini_path):
+        return jsonify({"success": False, "error": "INI no encontrado"}), 404
+    try:
+        with open(ini_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return jsonify({"success": True, "content": content, "path": f"db/{os.path.basename(ini_path)}"})
+    except (OSError, UnicodeDecodeError) as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/ini/write", methods=["POST"])
+def write_ini():
+    ini_path = resolve_active_ini_path()
+    if not ini_path:
+        return jsonify({"success": False, "error": "No hay INI activo"}), 404
+
+    content = request.json.get("content", "") if request.json else ""
+    if not isinstance(content, str):
+        return jsonify({"success": False, "error": "content debe ser string"}), 400
+
+    if len(content) > 200_000:
+        return jsonify({"success": False, "error": "INI demasiado grande"}), 400
+
+    backup_path = ini_path + ".bak"
+    try:
+        with open(ini_path, "r", encoding="utf-8") as f:
+            original = f.read()
+    except FileNotFoundError:
+        original = None
+
+    try:
+        old_config = load_config(ini_path)
+        old_streams = {s["name"]: s for s in old_config.get_all_streams()}
+    except (configparser.Error, OSError, ValueError) as e:
+        return jsonify({"success": False, "error": f"INI actual inválido: {e}"}), 400
+
+    ini_dir = os.path.dirname(ini_path) or "."
+    os.makedirs(ini_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".astra-", dir=ini_dir, suffix=".ini")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+    except (OSError, UnicodeEncodeError) as e:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return jsonify({"success": False, "error": str(e)}), 500
+
+    try:
+        new_config = load_config(tmp_path)
+        new_streams = {s["name"]: s for s in new_config.get_all_streams()}
+    except (configparser.Error, OSError, ValueError) as e:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return jsonify({
+            "success": False,
+            "error": f"INI nuevo inválido, no se aplicó: {e}",
+        }), 400
+
+    try:
+        os.replace(tmp_path, ini_path)
+    except OSError as e:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return jsonify({"success": False, "error": str(e)}), 500
+
+    old_names = set(old_streams.keys())
+    new_names = set(new_streams.keys())
+    removed = old_names - new_names
+    added = new_names - old_names
+    changed = set()
+
+    for name in old_names & new_names:
+        old_s = old_streams[name]
+        new_s = new_streams[name]
+        if (
+            old_s["original_url"] != new_s["original_url"]
+            or old_s["destination_url"] != new_s["destination_url"]
+            or old_s["ffmpeg_pre_options"] != new_s["ffmpeg_pre_options"]
+            or old_s["ffmpeg_post_options"] != new_s["ffmpeg_post_options"]
+            or old_s.get("ffmpeg_path", "") != new_s.get("ffmpeg_path", "")
+            or old_s.get("vaapi_driver", "") != new_s.get("vaapi_driver", "")
+            or old_s.get("vlc_transcode", "") != new_s.get("vlc_transcode", "")
+            or old_s.get("vlc_port") != new_s.get("vlc_port")
+        ):
+            changed.add(name)
+
+    for name in removed:
+        with stream_manager._lock:
+            if name in stream_manager.streams:
+                stream_manager.stop_stream(name)
+                del stream_manager.streams[name]
+
+    for name in added:
+        stream_manager.register_stream(name, new_streams[name])
+        if new_streams[name].get("autostart") or START_ALL_ON_BOOT:
+            stream_manager.start_stream(name)
+
+    for name in changed:
+        if name in stream_manager.streams:
+            was_running = stream_manager.streams[name].status == "running"
+            stream_manager.register_stream(name, new_streams[name])
+            if was_running:
+                stream_manager.restart_stream(name)
+
+    if original is not None:
+        try:
+            with open(backup_path, "w", encoding="utf-8") as f:
+                f.write(original)
+        except OSError:
+            logger.warning(f"No se pudo escribir backup {backup_path}")
+
+    return jsonify({
+        "success": True,
+        "removed": list(removed),
+        "added": list(added),
+        "changed": list(changed),
+    })
+
+
+def _sanitize_title(value):
+    """Limpia y valida el título de plataforma antes de guardarlo."""
+    if not isinstance(value, str):
+        return None
+    cleaned = _TITLE_SANITIZER.sub("", value.strip()[:_MAX_TITLE_LEN])
+    return cleaned or None
+
+
+@app.route("/api/config", methods=["GET"])
+def get_config():
+    return jsonify({
+        "start_all_on_boot": START_ALL_ON_BOOT,
+        "midnight_restart": MIDNIGHT_RESTART_ENABLED,
+        "auto_restart": AUTO_RESTART_ENABLED,
+        "platform_title": PLATFORM_TITLE,
+        "network": NET_INTERFACE,
+        "service": SERVICE_NAME,
+    })
+
+
+@app.route("/api/config", methods=["POST"])
+def set_config():
+    global START_ALL_ON_BOOT, MIDNIGHT_RESTART_ENABLED, AUTO_RESTART_ENABLED, PLATFORM_TITLE
+    if not request.json:
+        return jsonify({"success": False, "error": "JSON requerido"}), 400
+
+    with _CONFIG_LOCK:
+        if "start_all_on_boot" in request.json:
+            val = bool(request.json["start_all_on_boot"])
+            START_ALL_ON_BOOT = val
+            app_config["start_all_on_boot"] = val
+        if "midnight_restart" in request.json:
+            val = bool(request.json["midnight_restart"])
+            MIDNIGHT_RESTART_ENABLED = val
+            app_config["midnight_restart"] = val
+        if "auto_restart" in request.json:
+            val = bool(request.json["auto_restart"])
+            AUTO_RESTART_ENABLED = val
+            app_config["auto_restart"] = val
+        if "platform_title" in request.json:
+            cleaned = _sanitize_title(request.json["platform_title"])
+            if cleaned is None:
+                return jsonify({"success": False, "error": "Título vacío"}), 400
+            PLATFORM_TITLE = cleaned
+            app_config["platform_title"] = cleaned
+
+        try:
+            save_app_config(app_config)
+        except OSError as e:
+            logger.exception("Error guardando config")
+            return jsonify({"success": False, "error": str(e)}), 500
+
+    return jsonify({
+        "success": True,
+        "start_all_on_boot": START_ALL_ON_BOOT,
+        "midnight_restart": MIDNIGHT_RESTART_ENABLED,
+        "auto_restart": AUTO_RESTART_ENABLED,
+        "platform_title": PLATFORM_TITLE,
+    })
+
+
+@app.route("/api/errors", methods=["GET"])
+def get_errors():
+    errors = stream_manager.get_error_history()
+    return jsonify({"errors": errors})
+
+
+# -------- Multi-config (carpeta db/) ----------------------------------------
+
+_INI_TEMPLATE = (
+    "[servidor]\n"
+    "FFMPEG_PATH=/usr/bin/ffmpeg\n"
+    "\n"
+    "[01_Ejemplo]\n"
+    "Original_URL=https://origen.example.com/stream\n"
+    "Destination_URL=rtmp://127.0.0.1:1935/live/ejemplo\n"
+    "FFMPEG_PRE_OPTIONS=-re\n"
+    "FFMPEG_POST_OPTIONS=-c copy -f flv\n"
+    "autostart=true\n"
+)
+
+
+def _config_payload(name, full, size, mtime):
+    """Convierte una entrada (name, full, size, mtime) al JSON público."""
+    active = get_active_ini_name() or ""
+    return {
+        "name": name,
+        "path": f"db/{name}",
+        "size": size,
+        "modified": mtime,
+        "active": name == active,
+        "streams": count_streams_in_ini(full),
+    }
+
+
+@app.route("/api/configs", methods=["GET"])
+def configs_list():
+    items = [_config_payload(n, full, sz, mt) for (n, full, sz, mt) in list_db_configs()]
+    active = get_active_ini_name()
+    ini_path = resolve_active_ini_path()
+    return jsonify({
+        "success": True,
+        "configs": items,
+        "active": active,
+        "active_path": ini_path,
+        "db_dir": DB_DIR,
+        "env_override": bool((os.environ.get("ASTRA_INI") or "").strip()),
+    })
+
+
+@app.route("/api/configs", methods=["POST"])
+def configs_create():
+    data = request.json or {}
+    name = _validate_config_name(data.get("name", ""))
+    if not name:
+        return jsonify({"success": False, "error": "Nombre inválido. Usa solo letras, números, guiones y la extensión .ini."}), 400
+    target = os.path.join(DB_DIR, name)
+    if os.path.isfile(target):
+        return jsonify({"success": False, "error": f"{name} ya existe"}), 409
+    content = data.get("content")
+    if content is None:
+        content = _INI_TEMPLATE
+    if not isinstance(content, str):
+        return jsonify({"success": False, "error": "content debe ser string"}), 400
+    try:
+        load_config_from_content(content).get_all_streams()  # validación de parseo
+    except (configparser.Error, ValueError) as e:
+        return jsonify({"success": False, "error": f"INI inválido: {e}"}), 400
+    os.makedirs(DB_DIR, exist_ok=True)
+    try:
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    if data.get("activate"):
+        cfg = load_app_config()
+        cfg["active_config"] = f"db/{name}"
+        try:
+            save_app_config(cfg)
+        except OSError as e:
+            return jsonify({"success": False, "error": str(e)}), 500
+    return jsonify({"success": True, "name": name, "path": f"db/{name}"})
+
+
+@app.route("/api/configs/activate", methods=["POST"])
+def configs_activate():
+    data = request.json or {}
+    target = find_db_config(data.get("name", ""))
+    if not target or not os.path.isfile(target):
+        return jsonify({"success": False, "error": "Configuración no encontrada en db/"}), 404
+    base = os.path.basename(target)
+    cfg = load_app_config()
+    cfg["active_config"] = f"db/{base}"
+    try:
+        save_app_config(cfg)
+    except OSError as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+    # stop_all + cargar + arrancar
+    with stream_manager._lock:
+        try:
+            stream_manager.stop_all_and_cleanup()
+        except Exception as e:
+            logger.warning(f"stop_all_and_cleanup: {e}")
+        # limpiar referencias al manager
+        for name in list(stream_manager.streams.keys()):
+            stream_manager.streams.pop(name, None)
+        gc.collect()
+
+    loaded = 0
+    started = 0
+    try:
+        new_config = load_config(target)
+        for s in new_config.get_all_streams():
+            stream_manager.register_stream(s["name"], s)
+            loaded += 1
+            if s.get("autostart") or START_ALL_ON_BOOT:
+                stream_manager.start_stream(s["name"])
+                time.sleep(2)
+                started += 1
+    except (configparser.Error, OSError, ValueError) as e:
+        return jsonify({"success": False, "error": f"Error cargando {base}: {e}"}), 500
+
+    _apply_deployment_overrides()
+
+    return jsonify({
+        "success": True,
+        "active": base,
+        "loaded": loaded,
+        "started": started,
+        "platform_title": PLATFORM_TITLE,
+        "network": NET_INTERFACE,
+    })
+
+
+@app.route("/api/configs/<path:name>", methods=["DELETE"])
+def configs_delete(name):
+    target = find_db_config(name)
+    if not target or not os.path.isfile(target):
+        return jsonify({"success": False, "error": "No encontrada"}), 404
+    active_path = resolve_active_ini_path()
+    if active_path and os.path.abspath(active_path) == os.path.abspath(target):
+        return jsonify({"success": False, "error": "No se puede borrar la configuración activa. Activa otra primero."}), 400
+    try:
+        os.unlink(target)
+        bak = target + ".bak"
+        if os.path.isfile(bak):
+            os.unlink(bak)
+    except OSError as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    return jsonify({"success": True})
+
+
+class IniChangeWatcher:
+    """Vigila el INI activo y sincroniza streams añadidos/eliminados en caliente."""
+
+    def __init__(self, interval=10):
+        self._interval = interval
+        self._running = False
+        self._thread = None
+        self._last_mtime = None
+        self._last_ini_path = None
+        self._lock = threading.Lock()
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="IniWatcher")
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def _snapshot(self, ini_path):
+        try:
+            cfg = load_config(ini_path)
+            return {s["name"]: s for s in cfg.get_all_streams()}
+        except (configparser.Error, OSError, ValueError):
+            return None
+
+    def _loop(self):
+        # Espera a que el bootstrap inicial termine de registrar los streams
+        while self._running and not BOOTSTRAP_DONE.wait(timeout=1):
+            pass
+        if not self._running:
+            return
+        while self._running:
+            try:
+                ini_path = resolve_active_ini_path()
+                if ini_path and os.path.isfile(ini_path):
+                    mtime = os.path.getmtime(ini_path)
+                    changed_file = (
+                        self._last_ini_path != ini_path or self._last_mtime != mtime
+                    )
+                    if changed_file:
+                        streams = self._snapshot(ini_path)
+                        if streams is not None:
+                            self._sync(streams)
+                            self._last_mtime = mtime
+                            self._last_ini_path = ini_path
+            except Exception as e:
+                logger.warning(f"INI watcher error: {e}")
+            time.sleep(self._interval)
+
+    def _sync(self, new_streams):
+        with self._lock:
+            old_names = set(stream_manager.streams.keys())
+            new_names = set(new_streams.keys())
+
+            for name in old_names - new_names:
+                with stream_manager._lock:
+                    if name in stream_manager.streams:
+                        stream_manager.stop_stream(name)
+                        del stream_manager.streams[name]
+                logger.info(f"INI watcher: stream '{name}' eliminado del INI, detenido")
+
+            # Streams que ya existen: se actualiza la config en memoria
+            # (sin reiniciar; para aplicar cambios se usa la API).
+            for name in old_names & new_names:
+                stream_manager.register_stream(name, new_streams[name])
+
+            for name in new_names - old_names:
+                stream_manager.register_stream(name, new_streams[name])
+                if new_streams[name].get("autostart") or START_ALL_ON_BOOT:
+                    stream_manager.start_stream(name)
+                    logger.info(f"INI watcher: stream '{name}' añadido y arrancado")
+                else:
+                    logger.info(f"INI watcher: stream '{name}' añadido (autostart=false)")
+
+
+if __name__ == "__main__":
+    if "--init" in sys.argv:
+        migrated = migrate_root_to_db()
+        os.makedirs(DB_DIR, exist_ok=True)
+        existing = list_db_configs()
+        active = get_active_ini_name()
+        if migrated:
+            print(f"[init] Migrado cadena_rcn.ini → db/{migrated}")
+        elif not existing and not active:
+            template = os.path.join(BASE_DIR, "cadena_rcn.ini.example")
+            if os.path.isfile(template):
+                name = "1_local.ini"
+                target = os.path.join(DB_DIR, name)
+                with open(template, "r", encoding="utf-8") as src, open(target, "w", encoding="utf-8") as dst:
+                    dst.write(src.read())
+                cfg = load_app_config()
+                cfg["active_config"] = f"db/{name}"
+                save_app_config(cfg)
+                print(f"[init] Creado db/{name} desde cadena_rcn.ini.example")
+            else:
+                print("[init] db/ vacío y no hay cadena_rcn.ini.example. Ejecuta la UI para crear uno.")
+        else:
+            print(f"[init] db/ ya contiene {len(existing)} configuraciones, activa: {active or '(ninguna)'}")
+        sys.exit(0)
+
+    migrate_root_to_db()
+
+    # El panel se abre YA; los streams arrancan en paralelo.
+    threading.Thread(target=_bootstrap_streams_async, daemon=True).start()
+
+    monitor.start()
+    scheduler.start()
+    print("Monitor y scheduler iniciados")
+
+    ini_watcher = IniChangeWatcher()
+    ini_watcher.start()
+    print("INI watcher iniciado")
+
+    try:
+        app.run(host="0.0.0.0", port=5007, debug=False, threaded=True)
+    finally:
+        scheduler._running = False
+        monitor.stop()
+        stream_manager.stop_all_and_cleanup()

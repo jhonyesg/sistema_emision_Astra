@@ -6,31 +6,55 @@ import time
 
 from stream_manager import stream_manager
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 logger = logging.getLogger(__name__)
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
-# Grace period desde el start del stream: durante este tiempo no se evalua
-# el freeze, porque los streams IPTV/HLS pueden tardar en producir el primer
-# 'size=' o 'frame=' significativo.
-WARMUP_SECONDS = 90
 
-# Cuantos checks consecutivos fallidos antes de reiniciar (a check_interval=10s
-# 6 checks ~= 60s adicionales encima del grace period).
-FREEZE_CHECKS_BEFORE_RESTART = 6
+def _instance_config_file():
+    """config.json propio de la instancia (config.112_a.json)."""
+    ini = os.environ.get("ASTRA_INI", "")
+    stem = os.path.splitext(os.path.basename(ini))[0] if ini else ""
+    if not stem:
+        return None
+    return os.path.join(os.path.dirname(CONFIG_FILE), f"config.{stem}.json")
 
 
 def _read_auto_restart_enabled():
+    """Lee auto_restart del config de la instancia (y del base)."""
     try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r") as f:
-                cfg = json.load(f)
-                if isinstance(cfg, dict):
-                    return cfg.get("auto_restart", True)
+        cfg = {}
+        for path in (CONFIG_FILE, _instance_config_file()):
+            if not path or not os.path.exists(path):
+                continue
+            with open(path, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                cfg.update(data)
+        return cfg.get("auto_restart", True)
     except (OSError, json.JSONDecodeError) as e:
         logger.debug("No se pudo leer auto_restart de config: %s", e)
     return True
+
+# Grace period desde el start del stream: durante este tiempo no se evalua
+# el freeze. Reducido para detectar bloqueos rapidamente.
+WARMUP_SECONDS = 30
+
+# Cuantos checks consecutivos fallidos antes de reiniciar. Con check_interval=10s
+# y 3 checks se reacciona en ~30s adicionales despues del warmup (total ~60s).
+FREEZE_CHECKS_BEFORE_RESTART = 3
+
+# Anti-tormenta de reinicios (P0): sin esto, 14 streams caidos generaban
+# ~1,5 reinicios/segundo y el host se saturaba de procesos ffmpeg.
+MIN_RESTART_INTERVAL_GLOBAL = 3    # segundos minimos entre reinicios automaticos
+MAX_RESTARTS_PER_HOUR = 12         # tope de reinicios por stream y hora
+COOLDOWN_AFTER_MAX_RESTARTS = 600  # tras superar el tope, 10 min de pausa
+RECOVERY_INTERVAL = 600            # reintento de streams bloqueados por el breaker
 
 
 class StreamMonitor:
@@ -41,6 +65,8 @@ class StreamMonitor:
         self._thread = None
         self._frozen_streams = {}
         self._frozen_lock = threading.Lock()
+        self._restart_lock = threading.Lock()
+        self._last_restart_at = 0.0
 
     def start(self):
         if self._running:
@@ -75,7 +101,43 @@ class StreamMonitor:
         all_status = stream_manager.get_all_status()
         for name, status in all_status.items():
             self._check_freeze(name, status)
+        # Segunda pasada con estado FRESCO: si no, el snapshot viejo hacia que
+        # un stream recien reiniciado volviera a reiniciarse en el mismo ciclo.
+        all_status = stream_manager.get_all_status()
+        for name, status in all_status.items():
             self._check_process_health(name, status)
+            self._maybe_reset_breaker(name, status)
+
+    def _may_restart(self, name, stream):
+        """Controla el ritmo de reinicios (anti-tormenta)."""
+        now = time.time()
+        with self._restart_lock:
+            if now - self._last_restart_at < MIN_RESTART_INTERVAL_GLOBAL:
+                return False
+            self._last_restart_at = now
+        if stream.restarts_last_hour() >= MAX_RESTARTS_PER_HOUR:
+            retry_state = stream.get_retry_state()
+            last = retry_state.get("last_failure_at") or 0
+            if now - last < COOLDOWN_AFTER_MAX_RESTARTS:
+                logger.warning(
+                    "Stream '%s' supero %d reinicios/hora: en pausa hasta %ds.",
+                    name, MAX_RESTARTS_PER_HOUR, int(COOLDOWN_AFTER_MAX_RESTARTS),
+                )
+                return False
+        return True
+
+    def _maybe_reset_breaker(self, name, status):
+        """Si el stream lleva un rato estable, resetea el circuit breaker."""
+        if status.get("status") != "running":
+            return
+        stream = stream_manager.streams.get(name)
+        if not stream:
+            return
+        if stream.maybe_reset_on_stable():
+            logger.info(
+                "Stream '%s' estable tras varios reinicios, circuit breaker reseteado.",
+                name,
+            )
 
     def _check_freeze(self, name, status):
         if status.get("status") != "running":
@@ -121,6 +183,8 @@ class StreamMonitor:
         if count >= FREEZE_CHECKS_BEFORE_RESTART:
             with self._frozen_lock:
                 self._frozen_streams[name] = 0
+            if not self._may_restart(name, stream):
+                return
             logger.error("Stream '%s' congelado demasiado tiempo, reiniciando...", name)
             stream_manager.restart_stream(name, reason="frozen")
 
@@ -129,17 +193,58 @@ class StreamMonitor:
         if not stream:
             return
 
+        # Recuperacion de streams bloqueados por el circuit breaker: antes
+        # quedaban en 'error' para siempre y solo un humano los resucitaba.
+        if status.get("status") == "error":
+            self._try_recover_blocked(name, stream)
+            return
+
         if status.get("status") == "running" and not stream.is_running():
+            # Respetar circuit breaker: si ya esta bloqueado (error fatal o
+            # max_failures), no reintentar sin esperar la ventana de
+            # recuperacion.
+            blocked, why = stream.is_blocked()
+            if blocked:
+                logger.debug(
+                    "Stream '%s' en estado bloqueado (%s), monitor no reintenta.",
+                    name, why,
+                )
+                self._try_recover_blocked(name, stream)
+                return
+
             error_msg = stream.get_last_error_from_logs()
             logger.error(
                 "Stream '%s' proceso murio inesperadamente: %s", name, error_msg
             )
-            with stream._status_lock:
-                stream._status = "error"
-                stream.error_message = error_msg
+            if not self._may_restart(name, stream):
+                return
+            # NO cambiamos status a 'error' aqui. restart_stream decide:
+            #   - si permite retry: start() deja status='running' o 'error'
+            #   - si backoff/breaker: status queda como esta para que el
+            #     monitor siga intentando en el siguiente ciclo (solo el
+            #     breaker abierto cambia status a 'error' definitivo)
             stream_manager.restart_stream(name, reason="process_died")
 
+    def _try_recover_blocked(self, name, stream):
+        """Reintenta un stream bloqueado cada RECOVERY_INTERVAL segundos."""
+        retry_state = stream.get_retry_state()
+        last = retry_state.get("last_failure_at") or 0
+        elapsed = time.time() - last
+        if elapsed < RECOVERY_INTERVAL:
+            return False
+        if not self._may_restart(name, stream):
+            return False
+        logger.warning(
+            "Stream '%s' bloqueado (%s) hace %ds: reintentando automaticamente.",
+            name, retry_state.get("blocked_reason") or "max_failures", int(elapsed),
+        )
+        stream.reset_failures()
+        return stream_manager.restart_stream(name, reason="recovery")
 
-# freeze_threshold=60s + 6 checks = 6 minutos totales maximos antes de actuar
-# (mas generoso que antes para streams con arranque lento)
-monitor = StreamMonitor(check_interval=10, freeze_threshold=60)
+
+# freeze_threshold=20s + 3 checks (a 10s) ~= 30s extra tras warmup,
+# total ~60s antes de actuar. Suficiente para arrancar y reaccionar rapido
+# ante bloqueos.
+# check_interval=10: suficientemente holgado para no entrar en feedback-loop
+# de reconexiones sincronizadas contra el destino RTMP.
+monitor = StreamMonitor(check_interval=10, freeze_threshold=20)

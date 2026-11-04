@@ -201,6 +201,13 @@ Tabla con los últimos 5 reinicios automáticos: timestamp, nombre del stream, t
 
 ## Arquitectura del Sistema
 
+> **Aceleracion por GPU (NVIDIA + iGPU)**: desde el 27/10/2026 la decodificacion
+> y el escalado se hacen en la GPU NVIDIA (NVDEC + `scale_cuda`) y la iGPU solo
+> codifica, con la calidad intacta. Se activa por stream con `DECODER=nvidia`.
+> Detalle, requisitos y casos que no pueden migrarse:
+> [`docs/NVDEC_PIPELINE.md`](docs/NVDEC_PIPELINE.md).
+
+
 ```
 ┌────────────────────────────────────────────────────────────────────┐
 │                         Flask App (app.py)                          │
@@ -543,7 +550,7 @@ Además de los toggles en `config.json`, cada INI de `db/` puede llevar un bloqu
 
 ```ini
 [servidor]
-Title=Astra RTMP - Telemedellín
+Title=Astra RTMP
 Network=enp2s0
 Night_Restart=true
 Auto_Restart=true

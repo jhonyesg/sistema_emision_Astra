@@ -297,6 +297,18 @@
     <script>
         const API_BASE = '/api';
         const POLL_INTERVAL = 2000;
+        // Token de API: el servidor lo inyecta solo a los clientes de
+        // confianza (operador). Las operaciones de escritura lo exigen.
+        const ASTRA_TOKEN = '{{ astra_token }}';
+        if (ASTRA_TOKEN) {
+            const _astraFetch = window.fetch.bind(window);
+            window.fetch = function (url, opts) {
+                opts = opts || {};
+                opts.headers = Object.assign({}, opts.headers || {});
+                opts.headers['X-Astra-Token'] = ASTRA_TOKEN;
+                return _astraFetch(url, opts);
+            };
+        }
         let streamsData = {};
         let currentLogStream = null;
         let currentCmdStream = null;
@@ -309,6 +321,13 @@
         async function fetchStatus() {
             try {
                 const response = await fetch(`${API_BASE}/status`);
+                if (!response.ok) {
+                    document.getElementById('systemInfo')?.prepend(
+                        Object.assign(document.createElement('div'),
+                            { className: 'error', textContent: 'API no autorizada (401). Cliente fuera de la lista de confianza.' })
+                    );
+                    return;
+                }
                 const data = await response.json();
                 streamsData = data.streams;
                 updateUI(data);
