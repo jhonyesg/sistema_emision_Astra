@@ -13,7 +13,6 @@ Solo escribe en el log cuando detecta problemas.
 
 Uso: astra_watchdog.py [--verbose]
 """
-import glob
 import json
 import os
 import subprocess
@@ -24,31 +23,17 @@ import urllib.parse
 import urllib.request
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# (etiqueta, base URL, fichero de token)
+INSTANCES = [
+    ("112_A", "http://127.0.0.1:5006", ".api_token.112_a"),
+    ("112_B", "http://127.0.0.1:5007", ".api_token.112_b"),
+]
 SRS_API = "http://127.0.0.1:1986/api/v1/summaries"
 LOG_FILE = "/var/log/astra-watchdog.log"
-DISCO = "sdc"          # disco de grabaciones
+DISCO = "sdc"          # disco de grabaciones (10 TB)
 MAX_DISK_AWAIT_MS = 40
 MAX_SRS_CPU = 85
 MAX_HOST_LOAD = 20
-
-
-def discover_instances():
-    """Descubre las instancias locales por sus ficheros de token.
-
-    Cada instancia tiene un `.api_token.<instancia>` en la raiz del proyecto.
-    Se listan en vez de fijarlos en el codigo: asi el watchdog funciona en
-    cualquier nodo sin tocarlo.
-    """
-    instances = []
-    for path in sorted(glob.glob(os.path.join(BASE_DIR, ".api_token.*"))):
-        label = os.path.basename(path).lstrip(".").split(".", 1)[1]
-        # El puerto se deduce del sufijo de la instancia (_a -> 5006, _b -> 5007).
-        port = 5007 if label.endswith("_b") else 5006
-        instances.append((label, f"http://127.0.0.1:{port}", path))
-    return instances
-
-
-INSTANCES = discover_instances()
 
 VERBOSE = "--verbose" in sys.argv
 
@@ -82,7 +67,7 @@ def log(msg, always=False):
 
 def api_token(token_file):
     """Token de API de una instancia (fichero .api_token.<instancia>, 0600)."""
-    path = token_file if os.path.isabs(token_file) else os.path.join(BASE_DIR, token_file)
+    path = os.path.join(BASE_DIR, token_file)
     try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read().strip()
@@ -98,8 +83,18 @@ def http_json(url, method="GET", token="", timeout=20):
         return json.loads(r.read().decode())
 
 
+# El watchdog NO reinicia un stream que el monitor esta reintentando: cada
+# 'start' manual resetea el circuit breaker y anula el backoff, de modo que
+# el stream se reiniciaba cada 5 min para siempre. Solo interviene cuando el
+# stream esta en 'error'/'stopped' (ya no lo reintenta nadie) y no se ha
+# tocado hace WATCHDOG_COOLDOWN.
+WATCHDOG_COOLDOWN = 1800  # 30 min entre intervenciones del watchdog por stream
+_watchdog_history = {}
+
+
 def check_streams():
-    """Reinicia los streams caidos de cada instancia."""
+    """Alerta y reinicio de streams que el monitor ya no reintenta."""
+    now = time.time()
     for label, base, token_file in INSTANCES:
         token = api_token(token_file)
         try:
@@ -111,7 +106,7 @@ def check_streams():
         streams = data.get("streams", {})
         caidos = [
             (n, s) for n, s in streams.items()
-            if s.get("status") != "running" or not s.get("alive")
+            if s.get("status") != "running"
         ]
         if not caidos:
             log(f"{label}: {len(streams)} streams OK")
@@ -126,11 +121,15 @@ def check_streams():
                 f"fallos={cb.get('consecutive_failures')} bloqueado={cb.get('blocked_reason')}) {err}",
                 always=True,
             )
+            key = f"{label}/{name}"
+            if now - _watchdog_history.get(key, 0) < WATCHDOG_COOLDOWN:
+                continue
             try:
                 http_json(
                     f"{base}/api/stream/{urllib.parse.quote(name)}/start",
                     method="POST", token=token,
                 )
+                _watchdog_history[key] = now
                 log(f"   -> reinicio solicitado: {name}", always=True)
             except Exception as e:
                 log(f"   -> no se pudo reiniciar {name}: {e}", always=True)
