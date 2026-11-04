@@ -4,6 +4,62 @@ Todas las modificaciones relevantes del proyecto. Sigue [Keep a Changelog](https
 
 ---
 
+## [Sin versionar] — 2026-11-04 — Reinicio de canal que no levantaba: `stop()` abortaba a medias y dejaba huérfanos
+
+### Resumen en una línea
+El botón "Reiniciar" del panel dejaba el canal caído y publicaba en paralelo un ffmpeg huérfano: `stop()` lanzaba `subprocess.TimeoutExpired` (que hereda de `SubprocessError`, **no** de `OSError`), abortando el reinicio a mitad de camino.
+
+### Síntoma reportado
+Canal `<canal>` (`db/<instancia>.ini`) registrado pero "no levantaba" tras pulsar *Reiniciar*. El SRS rechazaba al publisher nuevo con `StreamBusy (1028)` porque el ffmpeg viejo seguía publicando a `rtmp://127.0.0.1:1935/live/<stream>`.
+
+### Causa raíz (confirmada con traceback en `/var/log/astra-emision.log`)
+```
+File "stream_manager.py", line 612, in stop
+    proc.wait(timeout=5)
+subprocess.TimeoutExpired: Command '[... ffmpeg ... -f nut /tmp/astra_nv/<otro-canal>...nut]' timed out after 5 seconds
+During handling of the above exception, another exception occurred:
+...
+File "stream_manager.py", line 615, in stop
+    proc.wait(timeout=5)
+```
+- El `except (OSError, ValueError)` del bloque de la etapa NVIDIA **no cubría** `TimeoutExpired`.
+- El proceso se "olvidaba" (`self._stage_process = None`) **antes** de comprobar su muerte → el ffmpeg sobrevivía sin control.
+- La excepción abortaba `stop()` → `restart_stream()` **nunca llegaba a `start()`** → el canal se quedaba caído.
+- El `except Exception` del monitor se comía la excepción y seguía: bucle silencioso.
+
+### Cambios aplicados
+| Archivo | Cambio |
+|---|---|
+| `stream_manager.py` | `_kill_process_tree()`: termina por grupo de procesos (`start_new_session=True` + `killpg`), **nunca lanza**, y devuelve `False` si el proceso sobrevive a SIGKILL. |
+| `stream_manager.py` | `stop()` reescrito: mata antes de soltar la referencia, no propaga excepciones, registra los pids supervivientes en `_leaked_pids` y borra el fifo siempre. |
+| `stream_manager.py` | `_read_output()` captura el proceso localmente: el hilo de la generación anterior ya no roba el `stderr` del proceso nuevo (provocaba "congelado" falsos). |
+| `stream_manager.py` | `_read_stage_output()`: la salida de un proceso ya no controlado va a `orphan_lines` en vez de `last_lines`; el monitor ya no atribuye el `Conversion failed!` de un huérfano al stream vivo (causa del bucle de reinicio de ~11 s). |
+| `stream_manager.py` | `restart_stream()`: aunque `stop()` falle, **siempre** se llega a `start()`. |
+| `stream_manager.py` | `reap_orphans()`: elimina ffmpeg que publican a nuestras URLs sin control (solo los que **no** son hijos de este proceso: red de seguridad). `kill_leaked()` y `cleanup_stale_pipes()` para los pids y fifos sobrantes. |
+| `stream_manager.py` | `kill_foreign_publishers()`: antes de arrancar, mata al ffmpeg ajeno que publica a la misma `Destination_URL` (evita el `StreamBusy`). |
+| `app.py`, `app_hot.py` | Arranque en 3 fases: registrar → reaper → arrancar. Ruta `/api/stream/<n>/restart` devuelve el error real en JSON en vez de un 500 vacío. |
+| `monitor.py` | Barrido periódico de huérfanos y pipes obsoletos (`REAP_INTERVAL=120 s`). |
+| `/etc/systemd/system/<instancia>_A.service` | `After/Wants=docker.service`, `ExecStartPre=tools/wait-for-deps.sh`, `Restart=always` (antes `on-failure`). |
+
+### Verificación post-despliegue
+```bash
+# Reinicio del canal (antes: se quedaba caido)
+curl -sS -X POST -H "X-Astra-Token: $(cat .api_token.<instancia>)" \
+     http://127.0.0.1:5006/api/stream/<canal>/restart
+#   → {"name":"<canal>","success":true}   en 2,3 s
+
+curl -sS http://127.0.0.1:5006/api/status | jq '.streams["<canal>"]'
+#   → status=running, alive=true, bitrate=1838.8 KBITS/S, rc=1, error=""
+```
+- 38/38 streams vivos, **0 huérfanos**, **0 pipes obsoletos** en `/tmp/astra_nv`.
+- El reaper detectó y eliminó un huérfano real (`live/<otro-stream>`) que habría dado `StreamBusy`.
+- Test de regresión: `/tmp/kilo/test_fix_huerfanos.py` (6 grupos, todos en verde).
+
+### Nota
+El mismo código se comparte con el otra instancia (`112_A`/`112_B`): el fix llega por sincronización, pero **cada servicio necesita su propio `systemctl restart`** para cargar el código nuevo.
+
+---
+
 ## [Sin versionar] — 2026-10-14 — Rename de unidades por colisión de prefijo
 
 ### Resumen en una línea

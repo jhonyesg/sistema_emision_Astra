@@ -402,9 +402,22 @@ def initialize_streams():
         return 0
     config = load_config(ini_path)
     streams = config.get_all_streams()
+    # Fase 1: registrar los streams (sin arrancar). Necesario para que el
+    # reaper sepa cuales Destination_URL son nuestras.
     for stream_config in streams:
         name = stream_config["name"]
         stream_manager.register_stream(name, stream_config)
+    # Fase 2: limpiar los ffmpeg huerfanos de la instancia anterior. Si uno
+    # de ellos sigue publicando a una de nuestras URLs, el SRS le daria
+    # StreamBusy (1028) al publisher nuevo y el canal no levantaria.
+    try:
+        stream_manager.reap_orphans()
+        stream_manager.cleanup_stale_pipes()
+    except Exception:
+        logger.exception("Error reapeando procesos huerfanos")
+    # Fase 3: arrancar.
+    for stream_config in streams:
+        name = stream_config["name"]
         if stream_config.get("autostart") or START_ALL_ON_BOOT:
             stream_manager.start_stream(name)
             # Antes: time.sleep(2) por stream (25 streams = 50 s de panel
@@ -582,7 +595,18 @@ def stop_stream(name):
 
 @app.route("/api/stream/<name>/restart", methods=["POST"])
 def restart_stream(name):
-    success = stream_manager.restart_stream(name)
+    # El reinicio no puede dejar el canal caido: stream_manager ya garantiza
+    # que stop() no aborta a medias y que se llega siempre a start(). Aqui solo
+    # se convierte cualquier error en una respuesta clara para el panel.
+    try:
+        success = stream_manager.restart_stream(name)
+    except Exception as exc:
+        logger.exception("Error reiniciando el stream '%s'", name)
+        return jsonify({
+            "success": False,
+            "name": name,
+            "error": str(exc)[:300],
+        }), 500
     return jsonify({"success": success, "name": name})
 
 

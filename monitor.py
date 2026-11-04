@@ -56,6 +56,11 @@ MAX_RESTARTS_PER_HOUR = 12         # tope de reinicios por stream y hora
 COOLDOWN_AFTER_MAX_RESTARTS = 600  # tras superar el tope, 10 min de pausa
 RECOVERY_INTERVAL = 600            # reintento de streams bloqueados por el breaker
 
+# Barrido de procesos huerfanos: ffmpeg que siguen publicando a una de
+# nuestras URLs sin que nadie los controle. El SRS les da StreamBusy (1028)
+# al publisher nuevo y el canal no levanta.
+REAP_INTERVAL = 120                # segundos entre barridos
+
 
 class StreamMonitor:
     def __init__(self, check_interval=10, freeze_threshold=60):
@@ -67,6 +72,7 @@ class StreamMonitor:
         self._frozen_lock = threading.Lock()
         self._restart_lock = threading.Lock()
         self._last_restart_at = 0.0
+        self._last_reap_at = 0.0
 
     def start(self):
         if self._running:
@@ -95,9 +101,30 @@ class StreamMonitor:
                 logger.exception("Error en el loop del monitor")
             time.sleep(self.check_interval)
 
+    def _reap_orphans(self):
+        """Elimina ffmpeg que publican a nuestras URLs sin control.
+
+        Sin esto, un reinicio que se quedo a medias deja el ffmpeg viejo
+        publicando en paralelo: el SRS rechaza al nuevo con StreamBusy
+        (1028) y el canal se queda caido sin ninguna explicacion.
+        """
+        try:
+            stream_manager.reap_orphans()
+            stream_manager.kill_leaked()
+            stream_manager.cleanup_stale_pipes()
+        except Exception:
+            logger.exception("Error en el barrido de procesos huerfanos")
+
     def _check_all_streams(self):
         if not _read_auto_restart_enabled():
             return
+        # Barrido periodico de huerfanos (no depende del estado de los
+        # streams: un huerfano puede existir aunque todos los streams
+        # 'parezcan' bien).
+        now = time.time()
+        if now - self._last_reap_at >= REAP_INTERVAL:
+            self._last_reap_at = now
+            self._reap_orphans()
         all_status = stream_manager.get_all_status()
         for name, status in all_status.items():
             self._check_freeze(name, status)

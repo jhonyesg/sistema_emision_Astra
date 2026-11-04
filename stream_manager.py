@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import shlex
+import signal
 import subprocess
 import threading
 import time
@@ -70,6 +71,186 @@ def _is_transient_error(message):
     return any(p in low for p in _TRANSIENT_ERROR_PATTERNS)
 
 
+def _kill_process_tree(proc, label, term_timeout=10, kill_timeout=5, group=True):
+    """Termina un proceso y su grupo de procesos. NUNCA lanza una excepcion.
+
+    Devuelve True si el proceso murio, False si sobrevive (queda huerfano).
+
+    Por que no puede lanzar excepcion: stop() se llama desde el boton
+    "Reiniciar" y desde el monitor. Si stop() lanza, el reinicio se corta a
+    medias: el proceso sigue vivo pero deja de estar controlado, el pipe no
+    se borra y el stream NO vuelve a arrancar. Eso fue exactamente lo que
+    paso con 'Conversion failed!': proc.wait() lanzaba TimeoutExpired (que
+    hereda de SubprocessError, no de OSError) y el `except (OSError,
+    ValueError)` no lo cubria. El monitor se comia la excepcion y el canal
+    se quedaba caido.
+
+    `group` debe ser False para procesos que NO se arrancaron con
+    start_new_session=True: matarian a todo el grupo, incluida la app.
+    """
+    if proc is None:
+        return True
+
+    try:
+        if proc.poll() is not None:
+            return True  # ya estaba muerto
+        pid = proc.pid
+    except (OSError, ValueError):
+        return True
+
+    def _signal_group(sig):
+        """Envia una senal a todo el grupo de procesos del ffmpeg."""
+        if not group:
+            return False
+        try:
+            target_pgid = os.getpgid(pid)
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+        if target_pgid == os.getpgrp():
+            # Peligro: ese proceso comparte grupo con la app. Matar al grupo
+            # mataria tambien a la app y a TODOS sus streams.
+            return False
+        try:
+            os.killpg(target_pgid, sig)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+
+    # 1) SIGTERM al grupo (el ffmpeg y cualquier hijo que haya creado).
+    if not _signal_group(signal.SIGTERM):
+        try:
+            proc.terminate()
+        except (OSError, ValueError):
+            pass
+    try:
+        proc.wait(timeout=term_timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        pass
+    except (OSError, ValueError):
+        return True
+
+    # 2) SIGKILL al grupo.
+    logger.warning("%s (pid %s) no termino con SIGTERM, usando SIGKILL", label, pid)
+    if not _signal_group(signal.SIGKILL):
+        try:
+            proc.kill()
+        except (OSError, ValueError):
+            pass
+    try:
+        proc.wait(timeout=kill_timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        logger.error(
+            "%s (pid %s) sobrevive SIGKILL: queda huerfano y lo eliminara el reaper",
+            label,
+            pid,
+        )
+        return False
+    except (OSError, ValueError):
+        return True
+
+
+def _close_process_pipes(proc):
+    """Cierra los descriptores de un Popen. Nunca lanza."""
+    if proc is None:
+        return
+    for attr in ("stderr", "stdout", "stdin"):
+        try:
+            handle = getattr(proc, attr, None)
+            if handle:
+                handle.close()
+        except (OSError, ValueError):
+            pass
+
+
+def _iter_process_cmdlines():
+    """Recorre /proc y devuelve (pid, argv) de cada proceso con linea de comandos."""
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as handle:
+                raw = handle.read()
+        except (OSError, ValueError):
+            continue
+        if not raw:
+            continue
+        parts = [p.decode("utf-8", "replace") for p in raw.split(b"\0") if p]
+        if parts:
+            yield int(entry), parts
+
+
+def _pid_alive(pid):
+    """True si el pid sigue existiendo."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _pid_matches(pid, destinations):
+    """Re-verifica que un pid sigue siendo uno de los nuestros.
+
+    Se usa justo antes de matar: entre el escaneo y el kill el pid pudo
+    liberarse y ser reutilizado por otro proceso.
+    """
+    for candidate, parts in _iter_process_cmdlines():
+        if candidate != pid:
+            continue
+        return _is_our_ffmpeg(parts, destinations)
+    return False
+
+
+def _looks_like_ffmpeg(parts):
+    """True si la linea de comandos corresponde a un ffmpeg.
+
+    Se mira argv[0] y argv[1]: un ffmpeg invocado a traves de un interprete
+    (script con shebang) tiene el interprete como argv[0].
+    """
+    if not parts:
+        return False
+    for candidate in parts[:2]:
+        if os.path.basename(candidate) == "ffmpeg":
+            return True
+    return False
+
+
+def _is_our_ffmpeg(parts, destinations):
+    """True si la linea de comandos es un ffmpeg nuestro (pipeline NVIDIA o
+    publicando a una Destination_URL nuestra)."""
+    if not _looks_like_ffmpeg(parts):
+        return False
+    if any(_NV_PIPE_DIR in part for part in parts):
+        return True
+    return parts[-1] in destinations
+
+
+def _pid_ppid(pid):
+    """Devuelve el pid del padre de un proceso, o None si no se puede leer."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            data = handle.read()
+    except (OSError, ValueError):
+        return None
+    try:
+        # El campo comm puede llevar espacios y parentesis: se parte por el
+        # ultimo ')'. Tras el va el estado y luego el ppid.
+        rest = data[data.rindex(b")") + 2:].split()
+        return int(rest[1])
+    except (ValueError, IndexError):
+        return None
+
+
 class StreamInstance:
     def __init__(self, name, config):
         self.name = name
@@ -108,6 +289,14 @@ class StreamInstance:
         self._stage_process = None
         self._pipe_path = None
         self._stage_output_thread = None
+        # Pids que sobrevivieron a SIGTERM+SIGKILL en un stop(): quedan
+        # publicando en paralelo y el SRS rechaza al nuevo publisher con
+        # StreamBusy (1028). Los lleva el reaper.
+        self._leaked_pids = []
+        # Salida de procesos que ya no controlamos (huerfanos). Se guarda
+        # aparte: si se mezclara en last_lines, el monitor atribuiria su
+        # "Conversion failed!" al stream vivo y lo mataria en bucle.
+        self.orphan_lines = deque(maxlen=200)
         # Control de "episodio de emision": un episodio empieza cuando el
         # proceso arranca OK y termina cuando muere o se congela. Permite
         # contar UN fallo por episodio real (antes nunca se contaban y el
@@ -401,6 +590,7 @@ class StreamInstance:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,
+                start_new_session=True,
             )
             # Esperar a que VLC esté listo (el puerto acepte conexiones)
             import socket as _socket
@@ -423,23 +613,24 @@ class StreamInstance:
             return None
 
     def _stop_vlc(self):
-        if self._vlc_process:
-            try:
-                self._vlc_process.terminate()
-                try:
-                    self._vlc_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self._vlc_process.kill()
-                    self._vlc_process.wait(timeout=3)
-            except (OSError, ValueError):
-                pass
-            finally:
-                logger.info(f"VLC transcoder detenido para '{self.name}'")
-                self._vlc_process = None
-                if self._vlc_port:
-                    stream_manager.release_vlc_port(self._vlc_port)
-                    self._vlc_port = None
-                    self._vlc_url = None
+        proc = self._vlc_process
+        if proc:
+            # Mismo criterio que los ffmpeg: nunca propagar una excepcion.
+            # Si wait() lanzaba TimeoutExpired, el VLC quedaba vivo y el
+            # stop() del stream se cortaba a medias.
+            _kill_process_tree(
+                proc,
+                f"VLC transcoder de '{self.name}'",
+                term_timeout=5,
+                kill_timeout=3,
+            )
+            _close_process_pipes(proc)
+            logger.info(f"VLC transcoder detenido para '{self.name}'")
+            self._vlc_process = None
+            if self._vlc_port:
+                stream_manager.release_vlc_port(self._vlc_port)
+                self._vlc_port = None
+                self._vlc_url = None
 
     def start(self):
         if self.process and self.is_running():
@@ -493,7 +684,9 @@ class StreamInstance:
                     stderr=subprocess.PIPE,
                     stdin=subprocess.DEVNULL,
                     env=self._build_env(),
+                    start_new_session=True,
                 )
+                stream_manager.note_spawn(self._stage_process.pid)
                 self._stage_output_thread = threading.Thread(
                     target=self._read_stage_output, daemon=True
                 )
@@ -508,7 +701,9 @@ class StreamInstance:
                 stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
                 env=self._build_env(),
+                start_new_session=True,
             )
+            stream_manager.note_spawn(self.process.pid)
             self.start_time = time.time()
             self._status = "running"
             self.mark_episode_started()
@@ -526,6 +721,13 @@ class StreamInstance:
             return False
 
     def _read_output(self):
+        # El proceso se captura aqui: si se leyera self.process en cada
+        # iteracion, el hilo de la generacion anterior se quedaria leyendo el
+        # stderr del proceso NUEVO (robandole sus lineas de progreso) y el
+        # monitor veria "stream congelado" con el stream sano.
+        proc = self.process
+        if proc is None or proc.stderr is None:
+            return
         # ffmpeg imprime su progreso (frame=/size=/bitrate=) con '\r', no '\n'.
         # readline() solo corta por '\n', asi que en streams sin mensajes de
         # log intercalados (que si traen '\n') el hilo se queda bloqueado
@@ -534,7 +736,7 @@ class StreamInstance:
         buf = b""
         try:
             while True:
-                chunk = self.process.stderr.read1(4096)
+                chunk = proc.stderr.read1(4096)
                 if not chunk:
                     break
                 buf += chunk
@@ -575,10 +777,18 @@ class StreamInstance:
                 if not text:
                     continue
                 ts = datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
-                with self._logs_lock:
-                    self.last_lines.append(f"[{ts}] [nv] {text}")
-                if "error" in text.lower() or "failed" in text.lower():
-                    self.error_message = text[:200]
+                # Si el proceso ya no es el que controlamos (quedo huerfano),
+                # su salida va a un buffer aparte: si se metiera en
+                # last_lines, el monitor leeria su "Conversion failed!" como
+                # error del stream vivo y lo reiniciaria en bucle.
+                if self._stage_process is proc:
+                    with self._logs_lock:
+                        self.last_lines.append(f"[{ts}] [nv] {text}")
+                    if "error" in text.lower() or "failed" in text.lower():
+                        self.error_message = text[:200]
+                else:
+                    with self._logs_lock:
+                        self.orphan_lines.append(f"[{ts}] [nv huerfano] {text}")
         except (OSError, ValueError):
             pass
 
@@ -641,47 +851,40 @@ class StreamInstance:
         return self.error_message or "Process died without error message"
 
     def stop(self):
-        if self.process:
-            try:
-                self.process.terminate()
-                try:
-                    self.process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    logger.warning(
-                        f"Stream '{self.name}' no terminó con SIGTERM, usando SIGKILL"
-                    )
-                    self.process.kill()
-                    self.process.wait(timeout=5)
-            finally:
-                proc = self.process
-                self.process = None
-                for stream_attr in ("stderr", "stdout", "stdin"):
-                    try:
-                        s = getattr(proc, stream_attr, None)
-                        if s:
-                            s.close()
-                    except (OSError, ValueError):
-                        pass
+        """Detiene el stream. NUNCA lanza una excepcion.
+
+        Orden importante: primero se mata (encoder y etapa NVIDIA), y solo
+        despues se sueltan las referencias. Antes se soltaban ANTES de
+        comprobar la muerte: si el wait() lanzaba TimeoutExpired, el proceso
+        quedaba vivo y sin control (huerfano) publicando en paralelo, el
+        pipe no se borraba y el stream no volvia a arrancar.
+        """
+        leaked = []
+
+        proc = self.process
+        if proc is not None:
+            if not _kill_process_tree(proc, f"Stream '{self.name}' (encoder)"):
+                leaked.append(proc.pid)
+            _close_process_pipes(proc)
+        self.process = None
+
         # Etapa NVIDIA: se detiene despues del encoder para que no quede
         # escribiendo en un pipe sin lector.
-        if self._stage_process:
-            proc = self._stage_process
-            self._stage_process = None
-            try:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=5)
-            except (OSError, ValueError):
-                pass
-            finally:
-                try:
-                    if proc.stderr:
-                        proc.stderr.close()
-                except (OSError, ValueError):
-                    pass
+        proc = self._stage_process
+        if proc is not None:
+            if not _kill_process_tree(proc, f"Stream '{self.name}' (etapa NVIDIA)"):
+                leaked.append(proc.pid)
+            _close_process_pipes(proc)
+        self._stage_process = None
+
+        if leaked:
+            self._leaked_pids.extend(leaked)
+            logger.error(
+                "Stream '%s' dejo procesos sin terminar (huerfanos): %s",
+                self.name,
+                leaked,
+            )
+
         if self._pipe_path:
             try:
                 os.unlink(self._pipe_path)
@@ -801,6 +1004,155 @@ class StreamManager:
         self._vlc_ports_used = set()
         self._vlc_port_min = 18090
         self._vlc_port_max = 18099
+        # Pids arrancados por este manager. Se registran en el mismo instante
+        # del Popen para que el reaper no mate un proceso que acaba de
+        # nacer y todavia no esta asignado a ningun stream.
+        self._known_pids = set()
+
+    def note_spawn(self, pid):
+        """Registra un pid recien arrancado por este manager."""
+        if pid:
+            with self._lock:
+                self._known_pids.add(pid)
+
+    def reap_orphans(self, dry_run=False, processes=None):
+        """Elimina los ffmpeg de ESTA plataforma que nadie esta controlando.
+
+        Un huerfano es un ffmpeg que sigue publicando a una de nuestras
+        Destination_URL (o escribiendo en un pipe de /tmp/astra_nv) pero cuyo
+        pid no esta registrado en ningun stream. Publica en paralelo al
+        stream nuevo, el SRS lo rechaza con StreamBusy (1028) y el canal no
+        levanta.
+
+        Solo se matan procesos que:
+          - son ffmpeg, y
+          - (escriben en un pipe del pipeline NVIDIA) o (publican a una
+            Destination_URL nuestra como ultimo argumento), y
+          - no son de ninguno de nuestros streams, y
+          - NO son hijos de este proceso.
+
+        Esa ultima condicion es la red de seguridad: un huerfano de una
+        instancia anterior queda adoptado por init (ppid=1), mientras que
+        los ffmpeg que este manager acaba de arrancar son hijos suyos. Asi
+        el reaper nunca puede matar la emision en curso por un error de
+        orden o de estado.
+
+        Nunca toca los procesos de otros servicios del host (el grabador
+        escribe a fichero, no a una Destination_URL nuestra).
+        """
+        tracked = set()
+        destinations = set()
+        with self._lock:
+            for stream in self.streams.values():
+                for proc in (stream.process, stream._stage_process):
+                    if proc is not None:
+                        tracked.add(proc.pid)
+                url = (stream.config or {}).get("destination_url")
+                if url:
+                    destinations.add(url)
+            tracked |= set(self._known_pids)
+            self._known_pids = {p for p in self._known_pids if _pid_alive(p)}
+
+        if not self.streams:
+            # Sin streams registrados no sabemos que procesos son nuestros:
+            # matar a ciegas llevaria por delante la emision entera.
+            logger.warning("[reaper] no hay streams registrados: no se reapea nada")
+            return []
+
+        snapshot = (
+            list(processes) if processes is not None else list(_iter_process_cmdlines())
+        )
+        by_pid = {pid: parts for pid, parts in snapshot}
+
+        orphans = []
+        for pid, parts in snapshot:
+            if pid in tracked or pid == os.getpid():
+                continue
+            if not _looks_like_ffmpeg(parts):
+                continue
+            if _pid_ppid(pid) == os.getpid():
+                continue  # es nuestro hijo: lo controla el manager
+            is_pipeline = any(_NV_PIPE_DIR in part for part in parts)
+            is_publisher = parts[-1] in destinations
+            if not (is_pipeline or is_publisher):
+                continue
+            orphans.append((pid, parts[-1] if is_publisher else _NV_PIPE_DIR))
+
+        for pid, target in orphans:
+            if dry_run:
+                logger.warning("[reaper] huerfano detectado: pid %s -> %s", pid, target)
+                continue
+            # Re-verificar justo antes de matar: entre el escaneo y el kill
+            # el pid pudo liberarse y reutilizarse.
+            parts = by_pid.get(pid)
+            if not parts or not _is_our_ffmpeg(parts, destinations):
+                continue
+            logger.warning(
+                "[reaper] eliminando ffmpeg huerfano: pid %s (%s)", pid, target
+            )
+            # SIGKILL al proceso, NO al grupo: el ffmpeg puede compartir
+            # grupo con la app y matar al grupo mataria la emision entera.
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        if orphans and not dry_run:
+            logger.warning("[reaper] %d proceso(s) huerfano(s) eliminado(s)", len(orphans))
+        return orphans
+
+    def kill_leaked(self):
+        """Mata los ffmpeg que un stop() dejo vivos (pids conocidos)."""
+        killed = []
+        with self._lock:
+            streams = list(self.streams.values())
+        for stream in streams:
+            if not stream._leaked_pids:
+                continue
+            for pid in list(stream._leaked_pids):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    killed.append(pid)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            stream._leaked_pids.clear()
+        if killed:
+            logger.warning(
+                "[reaper] %d proceso(s) filtrado(s) de stop() eliminados: %s",
+                len(killed),
+                killed,
+            )
+        return killed
+
+    def cleanup_stale_pipes(self):
+        """Borra los pipes (fifos) de /tmp/astra_nv que ya no usa nadie.
+
+        Un stop() que se corta a medias deja el fifo en disco. No rompen
+        nada, pero se acumulan (uno por reinicio fallido).
+        """
+        in_use = set()
+        for _pid, parts in _iter_process_cmdlines():
+            for part in parts:
+                if part.startswith(_NV_PIPE_DIR + "/"):
+                    in_use.add(os.path.basename(part))
+        removed = 0
+        try:
+            entries = os.listdir(_NV_PIPE_DIR)
+        except OSError:
+            return 0
+        for entry in entries:
+            if entry in in_use:
+                continue
+            path = os.path.join(_NV_PIPE_DIR, entry)
+            try:
+                if os.path.islink(path):
+                    continue
+                os.unlink(path)
+                removed += 1
+            except OSError:
+                pass
+        if removed:
+            logger.info("[reaper] %d pipe(s) obsoleto(s) eliminado(s)", removed)
+        return removed
 
     @staticmethod
     def is_port_free(port):
@@ -907,6 +1259,40 @@ class StreamManager:
                 self.streams[name].config = config
                 logger.info(f"Config actualizada para stream: {name}")
 
+    def kill_foreign_publishers(self, destination_url, keep_pids=()):
+        """Mata los ffmpeg que publican a una Destination_URL nuestra y que NO
+        son los de este stream.
+
+        Un huerfano de un reinicio anterior sigue publicando a la misma URL:
+        el SRS acepta al nuevo pero el viejo sigue conectado, y uno de los
+        dos se queda con StreamBusy (1028) o se pisan entre si. Por eso,
+        antes de arrancar un stream, se limpia la URL de destino.
+        """
+        if not destination_url:
+            return []
+        keep = {p for p in keep_pids if p}
+        killed = []
+        for pid, parts in _iter_process_cmdlines():
+            if pid in keep or pid == os.getpid():
+                continue
+            if not _looks_like_ffmpeg(parts):
+                continue
+            if parts[-1] != destination_url:
+                continue
+            logger.warning(
+                "Matando ffmpeg ajeno que publica a '%s' (pid %s): "
+                "dejaria al stream nuevo con StreamBusy",
+                destination_url,
+                pid,
+            )
+            # SIGKILL al proceso, no al grupo (ver nota en reap_orphans).
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            killed.append(pid)
+        return killed
+
     def start_stream(self, name):
         with self._lock:
             stream = self.streams.get(name)
@@ -916,6 +1302,10 @@ class StreamManager:
         # un operador pueda recuperar un stream bloqueado.
         stream.reset_failures()
         with stream._op_lock:
+            stream_manager.kill_foreign_publishers(
+                (stream.config or {}).get("destination_url"),
+                keep_pids=(stream.process.pid if stream.process else None,),
+            )
             return stream.start()
 
     def stop_stream(self, name):
@@ -976,7 +1366,16 @@ class StreamManager:
         episode_ended = stream.register_episode_end()
 
         with stream._op_lock:
-            stream.stop()
+            # stop() ya no deberia lanzar, pero si lo hiciera el reinicio
+            # MUSTO llegar a start(): si no, el canal se queda caido para
+            # siempre porque nadie vuelve a pedirle que arranque.
+            try:
+                stream.stop()
+            except Exception:
+                logger.exception(
+                    "Error deteniendo '%s' antes del reinicio; se sigue al start()",
+                    name,
+                )
             stream.restart_count += 1
             stream.note_restart()
             with self._lock:
@@ -990,6 +1389,12 @@ class StreamManager:
                 })
 
             time.sleep(2)
+            # Antes de arrancar, se limpia la URL de destino: si quedo un
+            # huerfano publicando a ella, el SRS le daria StreamBusy (1028)
+            # al publisher nuevo y el canal seguiria sin levantar.
+            stream_manager.kill_foreign_publishers(
+                (stream.config or {}).get("destination_url"),
+            )
             result = stream.start()
 
         # Contabilidad de fallos: UN fallo por episodio fallido.
