@@ -310,6 +310,25 @@
             };
         }
         let streamsData = {};
+        let _authErrorShown = false;
+
+        // Si la API responde 401 (IP fuera de la lista de confianza) se avisa
+        // UNA vez con un banner claro. Antes solo se veia "0 streams" y el
+        // panel parecia vacio sin explicar nada.
+        function showAuthError() {
+            if (_authErrorShown) return;
+            _authErrorShown = true;
+            const b = document.createElement('div');
+            b.id = 'astra-auth-error';
+            b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;' +
+                'background:#7f1d1d;color:#fff;padding:14px 20px;' +
+                'font:600 14px/1.4 system-ui,sans-serif;text-align:center;' +
+                'box-shadow:0 2px 12px rgba(0,0,0,.35)';
+            b.innerHTML = 'API no autorizada (401): esta IP no esta en la lista de confianza. ' +
+                'El panel queda sin datos. Contacta al administrador o abre la URL ' +
+                'con el token (?token=...).';
+            document.body.appendChild(b);
+        }
         let currentLogStream = null;
         let currentCmdStream = null;
         let currentCommand = null;
@@ -322,10 +341,7 @@
             try {
                 const response = await fetch(`${API_BASE}/status`);
                 if (!response.ok) {
-                    document.getElementById('systemInfo')?.prepend(
-                        Object.assign(document.createElement('div'),
-                            { className: 'error', textContent: 'API no autorizada (401). Cliente fuera de la lista de confianza.' })
-                    );
+                    if (response.status === 401) showAuthError();
                     return;
                 }
                 const data = await response.json();
@@ -339,7 +355,10 @@
         async function fetchConfigs() {
             try {
                 const response = await fetch(`${API_BASE}/configs`);
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                if (!response.ok) {
+                    if (response.status === 401) showAuthError();
+                    throw new Error(`HTTP ${response.status}`);
+                }
                 const data = await response.json();
                 renderConfigSelect(data);
                 const lbl = document.getElementById('ini-active-label');
