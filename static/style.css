@@ -271,6 +271,32 @@ header {
     gap: 8px;
 }
 
+/* Estado del audio verificado por el monitor sobre la URL publicada. */
+.audio-flag {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    white-space: nowrap;
+}
+
+.audio-flag.audio-ok {
+    background: rgba(0, 184, 148, 0.15);
+    color: #00b894;
+}
+
+.audio-flag.audio-missing {
+    background: rgba(231, 76, 60, 0.18);
+    color: #e74c3c;
+    animation: pulse 2s infinite;
+}
+
+.audio-flag.audio-none {
+    background: rgba(255, 255, 255, 0.08);
+    color: #95a5a6;
+}
+
 .status-dot {
     width: 10px;
     height: 10px;

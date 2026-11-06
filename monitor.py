@@ -1,10 +1,12 @@
 import json
 import logging
 import os
+import subprocess
+import sys
 import threading
 import time
 
-from stream_manager import stream_manager
+from stream_manager import probe_audio_packets, stream_manager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,6 +63,27 @@ RECOVERY_INTERVAL = 600            # reintento de streams bloqueados por el brea
 # al publisher nuevo y el canal no levanta.
 REAP_INTERVAL = 120                # segundos entre barridos
 
+# --- Salud de audio -------------------------------------------------------
+# El monitor solo miraba el contador de frames de VIDEO. Un canal con video
+# vivo y audio mudo pasaba por 'sano' para siempre y se quedaba mudo de
+# forma indefinida: el unico remedio era que un humano reiniciara.
+#
+# Aqui se sondea la URL REALMENTE publicada y se cuentan los paquetes de
+# audio que llegan. Si la pista existe pero no llega ni un paquete, el canal
+# esta mudo y se corrige reiniciando el ffmpeg (que reconecta al origen y
+# vuelve a leer el PMT: es lo que arregla el audio cuando el origen esta
+# bien).
+AUDIO_CHECK_INTERVAL = 60          # segundos entre sondeos
+AUDIO_PROBE_SECONDS = 8            # segundos de lectura en cada sondeo
+AUDIO_WARMUP_SECONDS = 240         # no se evalua hasta que el stream lleva estable
+AUDIO_STRIKES_BEFORE_RESTART = 3   # sondeos seguidos sin audio antes de actuar
+MAX_AUDIO_RESTARTS_PER_HOUR = 3    # tope de reinicios por audio y stream/hora
+AUDIO_ALERT_COOLDOWN = 1800        # no repetir la misma alerta antes de esto
+
+_NOTIFY_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "tools", "astra_notify.py"
+)
+
 
 class StreamMonitor:
     def __init__(self, check_interval=10, freeze_threshold=60):
@@ -73,6 +96,10 @@ class StreamMonitor:
         self._restart_lock = threading.Lock()
         self._last_restart_at = 0.0
         self._last_reap_at = 0.0
+        self._last_audio_check_at = 0.0
+        self._audio_alerted_at = {}
+        self._audio_thread = None
+        self._audio_running = False
 
     def start(self):
         if self._running:
@@ -134,6 +161,161 @@ class StreamMonitor:
         for name, status in all_status.items():
             self._check_process_health(name, status)
             self._maybe_reset_breaker(name, status)
+        # El audio se comprueba aparte y en su propio hilo: el sondeo tarda
+        # ~15 s y no debe retrasar la deteccion de caidas.
+        self._schedule_audio_check(all_status)
+
+    def _schedule_audio_check(self, all_status):
+        """Lanza el sondeo de audio en segundo plano (uno a la vez)."""
+        if self._audio_running:
+            return
+        now = time.time()
+        if now - self._last_audio_check_at < AUDIO_CHECK_INTERVAL:
+            return
+        self._last_audio_check_at = now
+        self._audio_running = True
+
+        def _worker():
+            try:
+                self._check_audio_health(all_status)
+            except Exception:
+                logger.exception("Error en el hilo de chequeo de audio")
+            finally:
+                self._audio_running = False
+
+        self._audio_thread = threading.Thread(target=_worker, daemon=True)
+        self._audio_thread.start()
+
+    # --- Deteccion y correccion automatica del audio ----------------------
+
+    def _notify(self, name, message):
+        """Avisa por Telegram (si esta configurado). Nunca rompe el monitor."""
+        now = time.time()
+        last = self._audio_alerted_at.get(name, 0)
+        if now - last < AUDIO_ALERT_COOLDOWN:
+            return
+        self._audio_alerted_at[name] = now
+        try:
+            subprocess.Popen(
+                [sys.executable, _NOTIFY_SCRIPT, f"[{name}] {message}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+    def _check_audio_health(self, all_status):
+        """Sondea el audio de cada stream en marcha."""
+        now = time.time()
+        for name, status in all_status.items():
+            if status.get("status") != "running":
+                continue
+            stream = stream_manager.streams.get(name)
+            if not stream or stream.start_time is None:
+                continue
+            if now - stream.start_time < AUDIO_WARMUP_SECONDS:
+                continue
+            try:
+                self._check_one_audio(name, stream)
+            except Exception:
+                logger.exception("Error en el chequeo de audio de '%s'", name)
+
+    def _check_one_audio(self, name, stream):
+        """Un stream: si tiene audio publicandolo y, si no, que se hace."""
+        dest = (stream.config or {}).get("destination_url")
+        if not dest:
+            return
+        result = probe_audio_packets(dest, seconds=AUDIO_PROBE_SECONDS)
+        state = stream.note_audio_probe(result)
+
+        if state == "ok":
+            if stream.audio_strikes:
+                logger.info(
+                    "Stream '%s': audio recuperado (%s paquetes en %ss)",
+                    name, result.get("packets"), AUDIO_PROBE_SECONDS,
+                )
+                self._notify(name, "Audio recuperado (se reinicio el canal).")
+            stream.clear_audio_strikes()
+            return
+
+        if state == "error":
+            # No se pudo sondear: no se actua (puede ser un fallo de red).
+            logger.debug(
+                "Stream '%s': sondeo de audio fallido (%s)",
+                name, result.get("detail"),
+            )
+            return
+
+        # state == 'missing' (pista de audio declarada pero 0 paquetes) o
+        # 'no_track' (la publicacion no declara pista de audio).
+        source_state = stream.source_audio_state()
+        if source_state in ("no_track", "missing"):
+            # El audio no llega desde el origen: reiniciar el ffmpeg NO lo
+            # arregla. Solo genera una tormenta de reinicios. Se avisa y se
+            # deja el canal con video.
+            logger.error(
+                "Stream '%s' sin audio en el ORIGEN (%s): reiniciar el ffmpeg "
+                "no lo arregla. Se deja el canal con video.",
+                name, source_state,
+            )
+            self._notify(
+                name,
+                f"Sin audio en el origen ({source_state}). El canal sigue con "
+                "video; revisar CAM/origen.",
+            )
+            stream.clear_audio_strikes()
+            return
+        if source_state != "ok":
+            # No se pudo confirmar el origen: no se reinicia nada todavia.
+            logger.debug(
+                "Stream '%s': origen no verificado (%s), no se actua aun",
+                name, source_state,
+            )
+            return
+
+        strikes = stream.note_audio_strike()
+        logger.warning(
+            "Stream '%s' mudo: la pista de audio no llega a la publicacion "
+            "(video %s paquetes, origen con audio OK). Sondeo %d/%d",
+            name, result.get("video_packets"), strikes,
+            AUDIO_STRIKES_BEFORE_RESTART,
+        )
+        if strikes < AUDIO_STRIKES_BEFORE_RESTART:
+            return
+
+        if stream.audio_restarts_last_hour() >= MAX_AUDIO_RESTARTS_PER_HOUR:
+            logger.error(
+                "Stream '%s' lleva %d reinicios por audio en la ultima hora: "
+                "se para de reiniciar para no hacer una tormenta.",
+                name, stream.audio_restarts_last_hour(),
+            )
+            self._notify(
+                name,
+                "Persiste la falta de audio tras varios reinicios. Requiere "
+                "revision manual.",
+            )
+            stream.clear_audio_strikes()
+            return
+
+        if not self._may_restart(name, stream):
+            return
+
+        logger.error(
+            "Stream '%s' mudo (video OK, 0 paquetes de audio): reiniciando "
+            "el ffmpeg para reconectar con el origen...",
+            name,
+        )
+        self._notify(
+            name,
+            "Canal sin audio (video OK). Reiniciando el ffmpeg para recuperar "
+            "el sonido.",
+        )
+        stream.note_audio_restart()
+        stream.clear_audio_strikes()
+        try:
+            stream_manager.restart_stream(name, reason="no_audio")
+        except Exception:
+            logger.exception("Error reiniciando '%s' por falta de audio", name)
 
     def _may_restart(self, name, stream):
         """Controla el ritmo de reinicios (anti-tormenta)."""

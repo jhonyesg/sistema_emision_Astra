@@ -314,6 +314,54 @@ restart_stream(name, reason):
 
 ---
 
+## Detección de Audio Muerto y Corrección Automática
+
+El chequeo de freeze mira el contador `frame=` de ffmpeg, que es **solo de video**. Un canal con video vivo y audio muerto pasaba por "sano" y se quedaba mudo indefinidamente: el único remedio era el reinicio manual.
+
+```
+StreamMonitor._schedule_audio_check()   (hilo aparte, cada 60 s)
+    │
+    └── _check_one_audio(name, stream)
+            │
+            ├── probe_audio_packets(destination_url)   ffprobe -count_packets
+            │       ├── "ok"       → hay audio, se limpia el contador
+            │       ├── "missing"  → la pista existe pero llega 0 packets → MUDO
+            │       ├── "no_track" → la publicación no declara pista de audio
+            │       └── "error"    → no se pudo sondear → no se actúa
+            │
+            ├── source_audio_state()   ¿el ORIGEN tiene audio?
+            │       ├── "missing"/"no_track" → el problema es el origen:
+            │       │       reiniciar el ffmpeg NO lo arregla → avisar y
+            │       │       dejar el canal con video (sin tormenta de reinicios)
+            │       └── "ok"              → el origen está bien, el fallo es del
+            │                               pipeline → reiniciar el ffmpeg
+            │
+            ├── 3 sondeos seguidos sin audio → restart_stream(reason="no_audio")
+            │       └── el motivo "no_audio" NO cuenta como fallo: el circuit
+            │           breaker no debe abrirse por estar sin sonido
+            │
+            ├── Tope: 3 reinicios por audio y stream/hora
+            └── Aviso por Telegram (tools/astra_notify.py)
+```
+
+| Parámetro | Valor | Para qué |
+|---|---|---|
+| `AUDIO_CHECK_INTERVAL` | 60 s | Cada cuánto se sondea |
+| `AUDIO_PROBE_SECONDS` | 8 s | Segundos de lectura en cada sondeo |
+| `AUDIO_WARMUP_SECONDS` | 240 s | No se evalúa hasta que el stream lleva estable |
+| `AUDIO_STRIKES_BEFORE_RESTART` | 3 | Sondeos seguidos sin audio antes de actuar |
+| `MAX_AUDIO_RESTARTS_PER_HOUR` | 3 | Tope de reinicios por audio y stream/hora |
+
+El estado se ve en el panel (`AUDIO OK` / `SIN AUDIO` / `SIN PISTA`) y en la API:
+
+```bash
+curl -s http://127.0.0.1:5006/api/status | jq '.streams["<canal>"] | {audio_state, audio_packets, audio_strikes}'
+```
+
+> La sonda usa el build estático `/usr/local/bin/ffprobe` y limpia `LD_LIBRARY_PATH`/`LIBVA_*` del entorno: el `/usr/bin/ffprobe` del sistema peta con `undefined symbol: va_fool_postp` al heredar el libva del servicio.
+
+---
+
 ## Reinicio a Medianoche (Full Memory Clean)
 
 ```

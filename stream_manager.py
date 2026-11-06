@@ -1,4 +1,5 @@
 import gc
+import json
 import logging
 import os
 import re
@@ -251,6 +252,143 @@ def _pid_ppid(pid):
         return None
 
 
+def _pid_age_seconds(pid):
+    """Edad del proceso en segundos (0.0 si no se puede determinar)."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            data = handle.read()
+        rest = data[data.rindex(b")") + 2:].split()
+        # starttime es el campo 22 del stat; tras partir por el ultimo ')',
+        # rest[0] es el campo 3 (state): starttime = rest[19].
+        starttime_ticks = int(rest[19])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+    try:
+        with open("/proc/uptime", "rb") as handle:
+            uptime = float(handle.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+    try:
+        ticks = os.sysconf("SC_CLK_TCK") or 100
+    except (ValueError, OSError, AttributeError):
+        ticks = 100
+    age = uptime - (starttime_ticks / float(ticks))
+    return age if age > 0 else 0.0
+
+
+# --- Sonda de audio --------------------------------------------------------
+# El monitorHistorically solo miraba el contador de frames de VIDEO. Un canal
+# con video vivo y audio mudo pasaba por 'sano' para siempre y se quedaba
+# mudo indefinidamente. Esta sonda lee la URL realmente publicada y cuenta
+# los paquetes de audio que llegan de verdad.
+#
+# El binario importa: el ffprobe del sistema (/usr/bin/ffprobe) carga
+# libva-x11 y peta con "undefined symbol: va_fool_postp" si hereda el
+# LD_LIBRARY_PATH=/opt/libva-new/lib del servicio. Por eso se usa el mismo
+# build estatico que el ffmpeg de emision (/usr/local/bin/ffprobe) y se le
+# limpia el entorno de VAAPI.
+def _pick_ffprobe():
+    for candidate in ("/usr/local/bin/ffprobe", "/usr/bin/ffprobe"):
+        if os.path.exists(candidate):
+            return candidate
+    return "ffprobe"
+
+
+_FFPROBE_BIN = _pick_ffprobe()
+
+# Un ffmpeg recien arrancado puede no estar todavia registrado en ningun
+# stream (la ventana entre Popen y note_spawn). Con esta gracia por edad el
+# reaper nunca se lleva por delante una emision en curso.
+ORPHAN_MIN_AGE_SECONDS = 120
+
+
+def _ffprobe_env():
+    """Entorno limpio para ffprobe: sin LD_LIBRARY_PATH de VAAPI."""
+    env = dict(os.environ)
+    for key in list(env):
+        if key.startswith("LIBVA") or key == "LD_LIBRARY_PATH":
+            env.pop(key, None)
+    return env
+
+
+def probe_audio_packets(url, seconds=8, timeout=25):
+    """Cuenta los paquetes de audio que llegan realmente por `url`.
+
+    Devuelve un dict con:
+      state         'ok'        hay pista de audio y llegan paquetes
+                    'missing'   hay pista de audio pero NO llega ningun paquete
+                                (el canal esta mudo: es el fallo que buscamos)
+                    'no_track'  la URL no publica ninguna pista de audio
+                    'error'     no se pudo sondear
+      packets       paquetes de audio leidos
+      video_packets paquetes de video leidos
+      detail        detalle del error, si lo hubo
+    """
+    empty = {"state": "error", "packets": 0, "video_packets": 0, "detail": "sin url"}
+    if not url:
+        return empty
+    cmd = [
+        _FFPROBE_BIN, "-v", "error", "-count_packets",
+        "-read_intervals", f"%+{int(seconds)}",
+        "-show_entries", "stream=index,codec_type,codec_name,nb_read_packets",
+        "-of", "json", url,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            env=_ffprobe_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return {"state": "error", "packets": 0, "video_packets": 0, "detail": "timeout"}
+    except (OSError, ValueError) as exc:
+        return {
+            "state": "error", "packets": 0, "video_packets": 0,
+            "detail": str(exc)[:200],
+        }
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip().splitlines()
+        return {
+            "state": "error", "packets": 0, "video_packets": 0,
+            "detail": (detail[-1] if detail else "ffprobe failed")[:200],
+        }
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return {
+            "state": "error", "packets": 0, "video_packets": 0,
+            "detail": "json invalido de ffprobe",
+        }
+
+    audio_packets = 0
+    video_packets = 0
+    has_audio = False
+    for entry in (data.get("streams") or []):
+        try:
+            count = int(entry.get("nb_read_packets") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if entry.get("codec_type") == "audio":
+            has_audio = True
+            audio_packets = max(audio_packets, count)
+        elif entry.get("codec_type") == "video":
+            video_packets = max(video_packets, count)
+
+    if not has_audio:
+        return {
+            "state": "no_track", "packets": 0, "video_packets": video_packets,
+            "detail": "la URL no publica pista de audio",
+        }
+    if audio_packets <= 0:
+        return {
+            "state": "missing", "packets": 0, "video_packets": video_packets,
+            "detail": "pista de audio declarada pero 0 paquetes recibidos",
+        }
+    return {
+        "state": "ok", "packets": audio_packets, "video_packets": video_packets,
+        "detail": "",
+    }
+
+
 class StreamInstance:
     def __init__(self, name, config):
         self.name = name
@@ -304,6 +442,17 @@ class StreamInstance:
         self._episode_active = False
         # Tope de reinicios por hora (anti-tormenta) y cooldown por stream.
         self._restart_times = deque(maxlen=60)
+        # Salud de audio. El monitor solo miraba video: un canal con video
+        # vivo y audio mudo pasaba por 'sano' y se quedaba mudo para siempre.
+        self.audio_state = "unknown"   # unknown | ok | missing | no_track | error
+        self.audio_packets = 0
+        self.audio_video_packets = 0
+        self.audio_checked_at = 0.0
+        self.audio_detail = ""
+        self.audio_strikes = 0
+        self._audio_restart_times = deque(maxlen=20)
+        self._audio_source_state = ""
+        self._audio_source_checked_at = 0.0
 
     def register_failure(self, message=""):
         """Registra una falla y devuelve (should_retry, fatal, backoff_seconds)."""
@@ -352,6 +501,59 @@ class StreamInstance:
         cutoff = time.time() - 3600
         with self._lock:
             return sum(1 for t in self._restart_times if t >= cutoff)
+
+    # --- Salud de audio ----------------------------------------------------
+
+    def note_audio_probe(self, result):
+        """Guarda el resultado del sondeo de audio de la URL publicada."""
+        with self._lock:
+            self.audio_state = (result or {}).get("state", "unknown")
+            self.audio_packets = (result or {}).get("packets", 0)
+            self.audio_video_packets = (result or {}).get("video_packets", 0)
+            self.audio_detail = ((result or {}).get("detail") or "")[:200]
+            self.audio_checked_at = time.time()
+            return self.audio_state
+
+    def note_audio_strike(self):
+        """Suma un fallo de audio consecutivo. Devuelve el nuevo total."""
+        with self._lock:
+            self.audio_strikes += 1
+            return self.audio_strikes
+
+    def clear_audio_strikes(self):
+        with self._lock:
+            self.audio_strikes = 0
+
+    def note_audio_restart(self):
+        """Registra un reinicio provocado por falta de audio."""
+        with self._lock:
+            self._audio_restart_times.append(time.time())
+
+    def audio_restarts_last_hour(self):
+        cutoff = time.time() - 3600
+        with self._lock:
+            return sum(1 for t in self._audio_restart_times if t >= cutoff)
+
+    def source_audio_state(self, ttl=300):
+        """Estado del audio en el ORIGEN, con cache para no sondear siempre.
+
+        Sirve para distinguir dos fallos muy distintos:
+          - origen sin audio  -> reiniciar el ffmpeg NO arregla nada
+          - origen con audio, salida muda -> reiniciar el ffmpeg SI lo arregla
+        """
+        now = time.time()
+        with self._lock:
+            if self._audio_source_state and (now - self._audio_source_checked_at) < ttl:
+                return self._audio_source_state
+        url = (self.config or {}).get("original_url")
+        if not url:
+            return "unknown"
+        result = probe_audio_packets(url)
+        state = result.get("state", "error")
+        with self._lock:
+            self._audio_source_state = state
+            self._audio_source_checked_at = time.time()
+        return state
 
     def reset_failures(self):
         with self._lock:
@@ -949,6 +1151,12 @@ class StreamInstance:
             ),
             "restart_count": self.restart_count,
             "error_message": self.error_message,
+            "audio_state": self.audio_state,
+            "audio_packets": self.audio_packets,
+            "audio_detail": self.audio_detail,
+            "audio_strikes": self.audio_strikes,
+            "audio_checked_at": self.audio_checked_at,
+            "audio_restarts_last_hour": self.audio_restarts_last_hour(),
             "alive": self.is_running(),
             "pid": self.process.pid if self.process and self.is_running() else None,
             "vlc": {
@@ -1071,7 +1279,27 @@ class StreamManager:
             if not _looks_like_ffmpeg(parts):
                 continue
             if _pid_ppid(pid) == os.getpid():
-                continue  # es nuestro hijo: lo controla el manager
+                # Es hijo NUESTRO. Solo es huerfano si no lo tiene NINGUN
+                # stream: un stop() que se corta a medias pierde la referencia
+                # y el ffmpeg se queda vivo publicando en paralelo (con el
+                # socket del origen lleno y el de RTMP en CLOSE-WAIT).
+                #
+                # Antes este caso se saltaba SIEMPRE, y por eso un huerfano
+                # sobrevivio 7 dias. La red de seguridad ahora es la EDAD:
+                # un ffmpeg de menos de ORPHAN_MIN_AGE_SECONDS puede ser uno
+                # que esta arrancando ahora mismo y todavia no esta
+                # registrado en ningun stream.
+                age = _pid_age_seconds(pid)
+                if age < ORPHAN_MIN_AGE_SECONDS:
+                    continue
+                is_pipeline = any(_NV_PIPE_DIR in part for part in parts)
+                is_publisher = parts[-1] in destinations
+                if not (is_pipeline or is_publisher):
+                    continue
+                orphans.append(
+                    (pid, parts[-1] if is_publisher else _NV_PIPE_DIR)
+                )
+                continue
             is_pipeline = any(_NV_PIPE_DIR in part for part in parts)
             is_publisher = parts[-1] in destinations
             if not (is_pipeline or is_publisher):
@@ -1361,9 +1589,17 @@ class StreamManager:
         if not is_auto:
             stream.reset_failures()
 
+        # Reiniciar por falta de audio NO es un fallo del stream: el canal
+        # estaba bien (video) pero mudo. Si se contabilizara como fallo, el
+        # circuit breaker abriria y el stream pasaria a 'error', dejando el
+        # canal caido del todo por estar sin sonido.
+        is_audio_fix = reason == "no_audio"
+
         # El episodio en curso (proceso que vivía) termina aqui: si estaba
         # activo, este reinicio se debe a un fallo real y debe contabilizarse.
         episode_ended = stream.register_episode_end()
+        if is_audio_fix:
+            episode_ended = False
 
         with stream._op_lock:
             # stop() ya no deberia lanzar, pero si lo hiciera el reinicio

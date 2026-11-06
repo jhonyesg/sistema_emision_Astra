@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from api_auth import ApiAuth
 from config_parser import load_config, load_config_from_content, load_deployment_overrides
 from monitor import monitor
-from stream_manager import stream_manager
+from stream_manager import _FFPROBE_BIN, _ffprobe_env, stream_manager
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_DIR = os.path.join(BASE_DIR, "db")
@@ -366,13 +366,20 @@ class MidnightRestartScheduler:
 
     def _run(self):
         already_executed = False
+        last_countdown_log = 0.0
         while self._running:
             now = datetime.now(timezone.utc).astimezone()
             next_midnight = (now + timedelta(days=1)).replace(
                 hour=0, minute=0, second=0, microsecond=0
             )
             seconds_until = (next_midnight - now).total_seconds()
-            logger.info(f"Próximo reinicio a medianoche en {int(seconds_until)} segundos")
+            # El countdown se registra cada 10 min (o en la ultima media hora):
+            # cada 60 s llenaba el log de 100k lineas sin aportar nada.
+            if seconds_until < 1800 or (time.time() - last_countdown_log) > 600:
+                last_countdown_log = time.time()
+                logger.info(
+                    "Próximo reinicio a medianoche en %d segundos", int(seconds_until)
+                )
             time.sleep(min(seconds_until, 60))
             if not self._running:
                 break
@@ -618,14 +625,17 @@ def _probe_audio_codec(url, timeout=5):
     """Devuelve dict con codec, sample_rate, channels, needs_vlc o None si falla."""
     try:
         cmd = [
-            "/usr/bin/ffprobe", "-hide_banner", "-v", "error",
+            _FFPROBE_BIN, "-hide_banner", "-v", "error",
             "-select_streams", "a:0",
             "-show_entries", "stream=codec_name,sample_rate,channels",
             "-of", "json",
             "-timeout", str(timeout * 1000000),
             url,
         ]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout + 2,
+            env=_ffprobe_env(),
+        )
         if r.returncode != 0:
             return {"codec": "unknown", "sample_rate": None, "channels": None,
                     "needs_vlc": False, "error": r.stderr.strip()[:200] or "ffprobe failed"}

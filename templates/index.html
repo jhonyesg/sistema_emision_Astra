@@ -637,11 +637,25 @@
 
             const statusText = {'running': 'Emitiendo', 'stopped': 'Detenido', 'starting': 'Iniciando', 'error': 'Error', 'restarting': 'Reiniciando'};
 
+            // Estado de audio: el monitor lo sondea en la URL publicada.
+            // 'missing' = la pista de audio existe pero no llega ningun paquete
+            // (canal mudo); 'ok' = audio llegando con normalidad.
+            const audioState = stream.audio_state || 'unknown';
+            let audioFlag = '';
+            if (audioState === 'missing') {
+                audioFlag = '<span class="audio-flag audio-missing" title="Sin audio: la pista existe pero no llegan paquetes. El monitor reinicia el ffmpeg para recuperarlo.">SIN AUDIO</span>';
+            } else if (audioState === 'ok') {
+                audioFlag = '<span class="audio-flag audio-ok" title="Audio verificado en la publicacion">AUDIO OK</span>';
+            } else if (audioState === 'no_track') {
+                audioFlag = '<span class="audio-flag audio-none" title="La publicacion no declara pista de audio">SIN PISTA</span>';
+            }
+
             tr.innerHTML = `
                 <td class="cell-number">${num}</td>
                 <td class="cell-status">
                     <span class="status-dot ${stream.status}"></span>
                     <span class="status-text">${statusText[stream.status] || stream.status}</span>
+                    ${audioFlag}
                 </td>
                 <td class="cell-name">${escapeHtml(name)}</td>
                 <td class="cell-bridge">${renderBridgeCell(name, stream.vlc)}</td>

@@ -4,6 +4,61 @@ Todas las modificaciones relevantes del proyecto. Sigue [Keep a Changelog](https
 
 ---
 
+## [Sin versionar] — 2026-11-05 — Canal mudo (video sí, audio no): detección y corrección automática del audio
+
+### Resumen en una línea
+El monitor solo miraba el contador de frames de **video**, así que un canal con video vivo y **cero audio** pasaba por "sano" y se quedaba mudo indefinidamente: el único remedio era que un humano reiniciara el canal a mano.
+
+### Síntoma reportado
+Un solo canal (`<canal>`, `db/<instancia>.ini`, destino `rtmp://127.0.0.1:1935/live/<stream>`). Al validar la emisión se veía **solo video, sin sonido**. Reiniciar el canal lo corregía, pero el problema "se había vuelto constante".
+
+### Diagnóstico (medido, no inferido)
+```bash
+# Salida publicada: video sí, audio 0
+ffprobe -v error -count_packets -read_intervals "%+10" \
+        -show_entries stream=codec_type,nb_read_packets \
+        -of json rtmp://127.0.0.1:1935/live/<stream>
+#   video: 300 paquetes   |   audio: (sin nb_read_packets) -> 0
+
+# Origen de ese canal: audio sano
+ffprobe ... http://127.0.0.1:8000/play/<origen>
+#   audio mp2 48 kHz estéreo, 342 paquetes
+```
+- El **mismo comando ffmpeg** ejecutado en frío sí genera audio (`video:4096KiB audio:187KiB`): el origen y la línea de comandos estaban bien.
+- El ffmpeg en producción (19 h 40 min de vida) publicaba **24,9 GB de video y 0 bytes de audio** (`audio_bitrate` vacío).
+- Había además un **ffmpeg huérfano** (7 días de vida) publicando la misma URL: su socket al origen tenía **6 MB sin leer** y su socket RTMP estaba en `CLOSE-WAIT` (el SRS ya lo había cerrado).
+
+### Causa raíz
+| # | Dónde | Defecto |
+|---|---|---|
+| A | `stream_manager.reap_orphans()` | Los ffmpeg **hijos de la app** se saltaban siempre (`_pid_ppid(pid) == os.getpid()` → `continue`). El huérfano real es hijo de la app, así que sobrevivía 7 días. |
+| B | `monitor._check_freeze()` | Solo se miraba el contador `frame=` (video). Video vivo + audio muerto = "sano" → nunca se reiniciaba. |
+| C | Origen (Astra CAM) | La conexión larga perdía el audio: reconectar (reiniciar) es lo que lo recuperaba. |
+
+### Cambios aplicados
+| Archivo | Cambio |
+|---|---|
+| `stream_manager.py` | `probe_audio_packets(url)`: cuenta los paquetes de audio **reales** de la URL publicada. Estados: `ok` / `missing` (pista declarada pero 0 paquetes = mudo) / `no_track` / `error`. Usa el build estático `/usr/local/bin/ffprobe` y limpia `LD_LIBRARY_PATH`/`LIBVA_*` del entorno (el `/usr/bin/ffprobe` del sistema peta con `undefined symbol: va_fool_postp` con el libva del servicio). |
+| `stream_manager.py` | `StreamInstance`: estado de audio (`audio_state`, `audio_packets`, `audio_strikes`, `audio_checked_at`),Methods `note_audio_probe()`, `note_audio_strike()`, `clear_audio_strikes()`, `note_audio_restart()`, `audio_restarts_last_hour()` y `source_audio_state()` (con caché de 300 s). |
+| `stream_manager.py` | `reap_orphans()`: ahora **sí** elimina los ffmpeg huérfanos que son hijos de la app, con una gracia por edad (`ORPHAN_MIN_AGE_SECONDS=120`) para no llevarse por delante una emisión en curso. |
+| `stream_manager.py` | `restart_stream()`: el motivo `no_audio` **no cuenta como fallo** (si contara, el circuit breaker abriría y el canal passería a `error`, quedándose caído del todo por estar sin sonido). |
+| `monitor.py` | Nuevo chequeo de audio en hilo aparte (`_check_audio_health` / `_check_one_audio`): cada 60 s, tras 240 s de warmup. 3 sondeos seguidos sin audio → reinicio del ffmpeg (`reason="no_audio"`). Tope de 3 reinicios/hora y aviso por Telegram (`tools/astra_notify.py`). |
+| `monitor.py` | Antes de reiniciar **distingue el origen**: si el origen tampoco tiene audio, reiniciar el ffmpeg no arregla nada → se avisa y se deja el canal con video (sin tormenta de reinicios). |
+| `app.py` | `_probe_audio_codec()` usa el mismo ffprobe y entorno limpio. Countdown de medianoche: de 1 línea/min a 1 cada 10 min (el log tenía 101 893 líneas). |
+| `templates/index.html`, `static/style.css` | Distintivo de audio en el panel: `AUDIO OK` / `SIN AUDIO` / `SIN PISTA`. |
+| `tests/test_audio_health.py` | 5 pruebas de la lógica de decisión (audio ok, mudo con origen bueno, mudo con origen roto, tope por hora, error de sondeo). |
+
+### Verificación post-despliegue
+```bash
+curl -s http://127.0.0.1:5006/api/status | jq '.streams["<canal>"]'
+#   → status=running, audio_state=ok, audio_packets>0
+python3 -m unittest discover -s tests -v   # 5 tests OK
+```
+- El huérfano de 7 días dejó de existir con el reinicio del servicio (mismo cgroup).
+- La salida publicada pasó de **0** paquetes de audio a **281** en 6 s.
+
+---
+
 ## [Sin versionar] — 2026-11-04 — Reinicio de canal que no levantaba: `stop()` abortaba a medias y dejaba huérfanos
 
 ### Resumen en una línea
