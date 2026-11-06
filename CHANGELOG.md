@@ -4,6 +4,41 @@ Todas las modificaciones relevantes del proyecto. Sigue [Keep a Changelog](https
 
 ---
 
+## [Sin versionar] — 2026-11-06 — Panel muerto tras reinicio del equipo: 401 en toda la API (el INI sí estaba bien)
+
+### Resumen en una línea
+El panel mostraba `0 activas / 0 total`, `— cargando...` en el selector de INI y `(sin servicio systemd)`, con la emisión perfectamente viva: **todas las llamadas `/api/*` devolvían 401**.
+
+### Diagnóstico (lo que de verdad pasó)
+```
+2026-11-06 12:05:24 INFO werkzeug: 192.168.0.137 - - [...] "GET /api/configs HTTP/1.1" 401 -
+2026-11-06 12:05:26 INFO werkzeug: 192.168.0.137 - - [...] "GET /api/status HTTP/1.1" 401 -
+2026-11-06 12:05:32 INFO werkzeug: 192.168.0.137 - - [...] "GET / HTTP/1.1" 200 -
+```
+- El HTML se servía bien (200) y todas las APIs fallaban (401) → la página loadea pero no puede leer nada.
+- `api_trusted_ips` en `config.json` era `["127.0.0.1", "::1", "192.168.0.117"]`. Tras el reinicio del equipo el navegador del operador pasó a `192.168.0.137` → fuera de la lista → 401.
+- **El INI sí se había cargado bien**: `resolve_active_ini_path()` da prioridad a `ASTRA_INI` (= `db/1_default.ini` en el unit) y el ffmpeg estaba publicando a `live/<stream>` con la config correcta. El servicio llevaba 1 h 25 min `active (running)` con el stream en marcha.
+- `active_config` en `config.json` apuntaba a `db/138_a.ini` (config de otro despliegue). No afectaba por el override del entorno, pero si faltara `ASTRA_INI` se cargaría el INI equivocado → corregido.
+
+### Cambios aplicados
+| Archivo | Cambio |
+|---|---|
+| `api_auth.py` | `ApiAuth` acepta un `config_loader`: la lista de IPs de confianza se **relee del disco** (TTL 5 s). Antes solo se leía al arrancar, así que corregirla exigía reiniciar el servicio. |
+| `app.py` | `ApiAuth(app_config, BASE_DIR, config_loader=load_app_config)`. |
+| `config.json`, `config.<instancia>.json` (fuera de git) | `api_trusted_ips` → `["127.0.0.1", "::1", "192.168.0.0/24"]` (el default del propio código: lecturas abiertas a la LAN, **escrituras siempre con token**). `active_config` → `db/1_default.ini`. |
+| `tests/test_api_auth.py` (nuevo) | 8 pruebas: IP de confianza, rango CIDR, default sin lista, relectura desde disco, cargador roto, escrituras exigen token, lectura sin token, token válido. |
+
+### Verificación
+```
+192.168.0.137  /api/status -> 200   /api/configs -> 200     (era 401)
+192.168.0.117  /api/status -> 200
+10.9.9.9       /api/status -> 401                           (sigue protegido)
+```
+- 13/13 tests OK (5 de audio + 8 de auth).
+- Emisión: `status=running`, `audio_state=ok`, `audio_packets=375`, `audio_strikes=0`.
+
+---
+
 ## [Sin versionar] — 2026-11-05 — Canal mudo (video sí, audio no): detección y corrección automática del audio
 
 ### Resumen en una línea

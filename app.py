@@ -469,7 +469,7 @@ def _get_markdown():
 # ----------------------------------------------------------------------
 # Autenticacion de la API (ver api_auth.py)
 # ----------------------------------------------------------------------
-api_auth = ApiAuth(app_config, BASE_DIR)
+api_auth = ApiAuth(app_config, BASE_DIR, config_loader=load_app_config)
 # El token se genera al arrancar: debe existir siempre (el watchdog y los
 # operadores lo necesitan) aunque nadie haya abierto la pagina.
 api_auth.token()

@@ -21,18 +21,30 @@ import logging
 import os
 import secrets
 import threading
+import time
 
 logger = logging.getLogger(__name__)
 
 MUTATING_METHODS = ("POST", "PUT", "DELETE", "PATCH")
 DEFAULT_TRUSTED_IPS = ["127.0.0.1", "::1", "192.168.0.0/24"]
 
+# Tiempo que se cachea la lista de IPs de confianza leida del disco.
+TRUSTED_IPS_TTL = 5.0
+
 
 class ApiAuth:
-    def __init__(self, config, base_dir=None):
+    def __init__(self, config, base_dir=None, config_loader=None):
         self._config = config
         self._base_dir = base_dir or os.getcwd()
         self._lock = threading.Lock()
+        # Cargador opcional que relee el config del disco. Sin esto, cambiar
+        # api_trusted_ips en config.json exigia reiniciar el servicio: tras un
+        # reinicio de equipo el navegador del operador cambiaba de IP y el
+        # panel se quedaba en 401 (0 streams, "cargando...") con la emision
+        # perfectamente viva.
+        self._config_loader = config_loader
+        self._cached_ips = None
+        self._cached_at = 0.0
 
     # ------------------------------------------------------------------
     def _token_path(self):
@@ -67,7 +79,30 @@ class ApiAuth:
             return token
 
     def trusted_ips(self):
-        ips = self._config.get("api_trusted_ips")
+        """IPs de confianza, releidas del disco si hay cargador.
+
+        La lista viva en config.json / config.<instancia>.json: releerla evita
+        que un cambio de IP del operador deje el panel inutilizable hasta el
+        proximo reinicio del servicio.
+        """
+        ips = None
+        if self._config_loader is not None:
+            now = time.time()
+            with self._lock:
+                if self._cached_ips is not None and (now - self._cached_at) < TRUSTED_IPS_TTL:
+                    return list(self._cached_ips)
+            try:
+                fresh = self._config_loader() or {}
+                ips = fresh.get("api_trusted_ips")
+            except Exception as exc:
+                logger.warning("No se pudo releer la config de API: %s", exc)
+                ips = None
+            if ips is not None:
+                with self._lock:
+                    self._cached_ips = list(ips) if not isinstance(ips, str) else [ips]
+                    self._cached_at = now
+        if ips is None:
+            ips = self._config.get("api_trusted_ips")
         if not ips:
             return list(DEFAULT_TRUSTED_IPS)
         if isinstance(ips, str):
