@@ -50,12 +50,12 @@ El canal <canal> no levantaba: el `ghost-detector` del `panel-api` (media server
 Cadena real, verificada en los logs del contenedor `mediaserver-platform`:
 
 1. El origen del canal estaba caido. La entrada usaba `https://<origen-hls>/<ruta>`, que ya no resuelve (HTTP 000). El enlace vivo, extraido de `https://<web-del-canal>.com/senal-en-vivo/` (iframe `<url-del-canal>`), es `https://<cdn-origen>/<ruta-del-canal>`.
-2. Con el origen caido, la sonda de audio del monitor (`probe_audio_packets` → `ffprobe` contra `Destination_URL`) conectaba como **rtmp-play** a una clave sin publisher. SRS creaba un *live source* fantasma (`new live source, stream_url=/live/cosmovision_bk`) con `recv=0/send=0`.
-3. Ese source fantasma dejaba al `ghost-detector` con un **candidato viejo** (timestamp de hace minutos) para `cosmovision_bk`.
+2. Con el origen caido, la sonda de audio del monitor (`probe_audio_packets` → `ffprobe` contra `Destination_URL`) conectaba como **rtmp-play** a una clave sin publisher. SRS creaba un *live source* fantasma (`new live source, stream_url=/live/<canal>`) con `recv=0/send=0`.
+3. Ese source fantasma dejaba al `ghost-detector` con un **candidato viejo** (timestamp de hace minutos) para `<canal>`.
 4. Al volver el origen y conectar el publisher real, el `ghost-detector` confirmaba el candidato y lo expulsaba:
    ```
-   [ghost-detector] WARNING: GHOST CONFIRMADO stream=cosmovision_bk cid=ye40z00n id=vid-536k800 age=30s recv=0 send=0 publish_active=True threshold=30s
-   [ghost-detector] INFO: ghost_detector: stream=cosmovision_bk cid=ye40z00n age=30s publish_active=True kicked=1 disposed=False
+   [ghost-detector] WARNING: GHOST CONFIRMADO stream=<canal> cid=ye40z00n id=vid-536k800 age=30s recv=0 send=0 publish_active=True threshold=30s
+   [ghost-detector] INFO: ghost_detector: stream=<canal> cid=ye40z00n age=30s publish_active=True kicked=1 disposed=False
    ```
    El `DELETE http://127.0.0.1:1986/api/v1/clients/<cid>` que aparece en el log de SRS es **de ese detector**, no una caida de red. El `Broken pipe` del ffmpeg es la consecuencia, no la causa.
 
@@ -77,8 +77,8 @@ El `ghost-detector` sigue teniendo la carrera de 30 s: si el origen cae mas de 3
 ```
 <canal>  running | 1932.6 KBITS/S | alive: True | error: (ninguno)
 SRS: publish.active=true  kbps={"recv_30s": 1957, "send_30s": 1962}  clients=2
-FLV http://127.0.0.1:8080/live/cosmovision_bk.flv -> 200, h264 720x408 + aac 48 kHz
-Tras el reinicio: sin 'candidato cosmovision_bk' ni 'GHOST CONFIRMADO' en el log del detector
+FLV http://127.0.0.1:8080/live/<canal>.flv -> 200, h264 720x408 + aac 48 kHz
+Tras el reinicio: sin 'candidato <canal>' ni 'GHOST CONFIRMADO' en el log del detector
 ```
 
 ---
