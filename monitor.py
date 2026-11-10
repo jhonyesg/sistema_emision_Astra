@@ -53,10 +53,16 @@ FREEZE_CHECKS_BEFORE_RESTART = 3
 
 # Anti-tormenta de reinicios (P0): sin esto, 14 streams caidos generaban
 # ~1,5 reinicios/segundo y el host se saturaba de procesos ffmpeg.
-MIN_RESTART_INTERVAL_GLOBAL = 3    # segundos minimos entre reinicios automaticos
+#
+# El tope es POR STREAM (12 reinicios/hora con 10 min de pausa). No existe
+# un tope global: un canal caido debe poder reintentarse siempre, y un
+# stream ruidoso no puede impedir que otro recupere la emision.
 MAX_RESTARTS_PER_HOUR = 12         # tope de reinicios por stream y hora
 COOLDOWN_AFTER_MAX_RESTARTS = 600  # tras superar el tope, 10 min de pausa
-RECOVERY_INTERVAL = 600            # reintento de streams bloqueados por el breaker
+# Cuantos reinicios se lanzan como maximo en un ciclo del monitor. Si hay
+# muchos canales caidos a la vez, el resto espera al siguiente ciclo en vez
+# de alargar el actual.
+RECOVERIES_PER_CYCLE = 6
 
 # Barrido de procesos huerfanos: ffmpeg que siguen publicando a una de
 # nuestras URLs sin que nadie los controle. El SRS les da StreamBusy (1028)
@@ -96,6 +102,11 @@ class StreamMonitor:
         self._restart_lock = threading.Lock()
         self._last_restart_at = 0.0
         self._last_reap_at = 0.0
+        # Presupuesto de reinicios del ciclo en curso. Se repone en cada
+        # vuelta de _check_all_streams; arranca con el valor completo para
+        # que un monitor recien creado (o usado fuera del ciclo) pueda
+        # actuar sin quedarse sin turno.
+        self._cycle_budget = RECOVERIES_PER_CYCLE
         self._last_audio_check_at = 0.0
         self._audio_alerted_at = {}
         self._audio_thread = None
@@ -145,6 +156,11 @@ class StreamMonitor:
     def _check_all_streams(self):
         if not _read_auto_restart_enabled():
             return
+        # Presupuesto de reinicios de este ciclo: si hay muchos canales
+        # caidos, no se lanzan todos en el mismo ciclo (el monitor se
+        # alargaria y el resto esperaria al siguiente).
+        with self._restart_lock:
+            self._cycle_budget = RECOVERIES_PER_CYCLE
         # Barrido periodico de huerfanos (no depende del estado de los
         # streams: un huerfano puede existir aunque todos los streams
         # 'parezcan' bien).
@@ -153,14 +169,32 @@ class StreamMonitor:
             self._last_reap_at = now
             self._reap_orphans()
         all_status = stream_manager.get_all_status()
-        for name, status in all_status.items():
+        # Prioridad: primero los canales caidos (status 'error'), y de
+        # entre ellos los mas antiguos. Son los que llevan mas tiempo sin
+        # emitiendo y los que mas necesitan que se intente.
+        ordered = self._by_priority(all_status)
+        for name, status in ordered:
             self._check_freeze(name, status)
         # Segunda pasada con estado FRESCO: si no, el snapshot viejo hacia que
         # un stream recien reiniciado volviera a reiniciarse en el mismo ciclo.
         all_status = stream_manager.get_all_status()
-        for name, status in all_status.items():
+        ordered = self._by_priority(all_status)
+        for name, status in ordered:
             self._check_process_health(name, status)
             self._maybe_reset_breaker(name, status)
+
+    @staticmethod
+    def _by_priority(all_status):
+        """Ordena los streams: primero los caidos y mas antiguos."""
+        def key(item):
+            name, status = item
+            failed = status.get("status") == "error"
+            stream = stream_manager.streams.get(name)
+            last = 0
+            if stream is not None:
+                last = stream.get_retry_state().get("last_failure_at") or 0
+            return (0 if failed else 1, last)
+        return sorted(all_status.items(), key=key)
         # El audio se comprueba aparte y en su propio hilo: el sondeo tarda
         # ~15 s y no debe retrasar la deteccion de caidas.
         self._schedule_audio_check(all_status)
@@ -318,12 +352,20 @@ class StreamMonitor:
             logger.exception("Error reiniciando '%s' por falta de audio", name)
 
     def _may_restart(self, name, stream):
-        """Controla el ritmo de reinicios (anti-tormenta)."""
+        """Controla el ritmo de reinicios (anti-tormenta).
+
+        Dos topes, ambos POR STREAM:
+          - 12 reinicios/hora: tras superarlos, 10 min de pausa. Evita la
+            tormenta cuando el origen esta caido.
+          - presupuesto por ciclo del monitor: evita que el ciclo se alargue
+            si hay muchos canales caidos a la vez.
+
+        Lo que NO hay es un tope global de reinicios: un canal caido debe
+        poder reintentarse siempre, y un stream ruidoso no puede tapar la
+        recuperacion de otro (eso dejaba dos canales caidos indefinidamente
+        mientras un tercero renovaba el turno global en cada ciclo).
+        """
         now = time.time()
-        with self._restart_lock:
-            if now - self._last_restart_at < MIN_RESTART_INTERVAL_GLOBAL:
-                return False
-            self._last_restart_at = now
         if stream.restarts_last_hour() >= MAX_RESTARTS_PER_HOUR:
             retry_state = stream.get_retry_state()
             last = retry_state.get("last_failure_at") or 0
@@ -333,6 +375,14 @@ class StreamMonitor:
                     name, MAX_RESTARTS_PER_HOUR, int(COOLDOWN_AFTER_MAX_RESTARTS),
                 )
                 return False
+        with self._restart_lock:
+            if self._cycle_budget <= 0:
+                logger.debug(
+                    "Presupuesto de reinicios del ciclo agotado: '%s' espera al "
+                    "siguiente ciclo.", name,
+                )
+                return False
+            self._cycle_budget -= 1
         return True
 
     def _maybe_reset_breaker(self, name, status):
@@ -392,6 +442,16 @@ class StreamMonitor:
         if count >= FREEZE_CHECKS_BEFORE_RESTART:
             with self._frozen_lock:
                 self._frozen_streams[name] = 0
+            # Respetar el backoff del stream: si acaba de fallar, no se
+            # reinicia por congelamiento (seria el mismo fallo otra vez).
+            retry_state = stream.get_retry_state()
+            wait = (retry_state.get("next_retry_at") or 0) - time.time()
+            if wait > 0:
+                logger.debug(
+                    "Stream '%s' congelado pero en backoff: %.0fs de espera.",
+                    name, wait,
+                )
+                return
             if not self._may_restart(name, stream):
                 return
             logger.error("Stream '%s' congelado demasiado tiempo, reiniciando...", name)
@@ -402,23 +462,22 @@ class StreamMonitor:
         if not stream:
             return
 
-        # Recuperacion de streams bloqueados por el circuit breaker: antes
-        # quedaban en 'error' para siempre y solo un humano los resucitaba.
+        # Canal caido: se reintenta cuando toque su backoff. Sin techo de
+        # reintentos.
         if status.get("status") == "error":
             self._try_recover_blocked(name, stream)
             return
 
         if status.get("status") == "running" and not stream.is_running():
-            # Respetar circuit breaker: si ya esta bloqueado (error fatal o
-            # max_failures), no reintentar sin esperar la ventana de
-            # recuperacion.
-            blocked, why = stream.is_blocked()
-            if blocked:
+            # El proceso murio: se reintenta, respetando el backoff del
+            # stream (que es lo que evita el bucle de reinicios corto).
+            retry_state = stream.get_retry_state()
+            wait = (retry_state.get("next_retry_at") or 0) - time.time()
+            if wait > 0:
                 logger.debug(
-                    "Stream '%s' en estado bloqueado (%s), monitor no reintenta.",
-                    name, why,
+                    "Stream '%s' caido: faltan %.0fs para el siguiente reintento.",
+                    name, wait,
                 )
-                self._try_recover_blocked(name, stream)
                 return
 
             error_msg = stream.get_last_error_from_logs()
@@ -435,19 +494,34 @@ class StreamMonitor:
             stream_manager.restart_stream(name, reason="process_died")
 
     def _try_recover_blocked(self, name, stream):
-        """Reintenta un stream bloqueado cada RECOVERY_INTERVAL segundos."""
+        """Reintenta un stream caido cuando se cumple su backoff.
+
+        No hay techo de reintentos: el canal vuelve solo en cuanto su origen
+        se recupere. El ritmo lo marca el backoff del propio stream
+        (5s, 15s, 30s, 60s, 120s y 300s como tope), no un intervalo fijo.
+
+        OJO: no se resetean los fallos aqui. Si se resetearan, el backoff
+        volveria a empezar por 5 s y el stream caido entraria en un bucle
+        corto de reinicios. El contador se limpia solo cuando el stream
+        aguanta estable (_maybe_reset_breaker).
+        """
         retry_state = stream.get_retry_state()
-        last = retry_state.get("last_failure_at") or 0
-        elapsed = time.time() - last
-        if elapsed < RECOVERY_INTERVAL:
+        next_retry_at = retry_state.get("next_retry_at") or 0
+        wait = next_retry_at - time.time()
+        if wait > 0:
+            logger.debug(
+                "Stream '%s' caido: faltan %.0fs para el siguiente reintento.",
+                name, wait,
+            )
             return False
         if not self._may_restart(name, stream):
             return False
         logger.warning(
-            "Stream '%s' bloqueado (%s) hace %ds: reintentando automaticamente.",
-            name, retry_state.get("blocked_reason") or "max_failures", int(elapsed),
+            "Stream '%s' caido (%s, %d fallos): reintentando automaticamente.",
+            name,
+            retry_state.get("blocked_reason") or "sin motivo",
+            retry_state.get("consecutive_failures") or 0,
         )
-        stream.reset_failures()
         return stream_manager.restart_stream(name, reason="recovery")
 
 

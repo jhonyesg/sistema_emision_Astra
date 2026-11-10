@@ -23,7 +23,16 @@ _DEFAULT_TITLE = "Sistema de Emisión 24/7-Astra"
 # Circuit breaker: cuanto tarda cada backoff antes del siguiente reintento.
 # Tras 4to fallo consecutivo, el stream queda en estado 'error' y NO se
 # reintenta mas. Solo un start manual resetea el contador.
-_RETRY_BACKOFF_SECONDS = [5, 15, 30, 60]
+# Ritmo de reintentos. Un sistema de emision NO puede tener un techo de
+# reintentos: si el origen se cae, el canal tiene que volver solo en
+# cuanto la fuente se recupere. Lo que se acota es el RITMO (backoff
+# creciente con tope), nunca la CANTIDAD de intentos.
+_RETRY_BACKOFF_SECONDS = [5, 15, 30, 60, 120, 300]
+# Un error "fatal" (404, protocolo inexistente) no se reintenta cada 5 s: se
+# avisa al operador y se reintenta con un ritmo lento, pero SIEMPRE.
+_FATAL_RETRY_SECONDS = 300
+# Tras este numero de fallos consecutivos el stream se marca 'error' en el
+# panel (senal para el operador). NO deja de reintentarse.
 _MAX_CONSECUTIVE_FAILURES = 4
 _STABLE_RUNNING_SECONDS = 60  # tiempo en 'running' que resetea el breaker
 
@@ -51,6 +60,23 @@ _TRANSIENT_ERROR_PATTERNS = (
     "input/output error",
     "broken pipe",
 )
+
+# Fallo del encoder VAAPI de Intel: el driver no consigue reservar la
+# superficie que necesita el encoder y aborta el proceso. El sintoma es
+# "Access unit too large" seguido de ENOSPC y del assertion
+# "av_assert0(pic->prev)" en vaapi_encode.c.
+#
+# Se resuelve deinterlazando: el encoder recibe frames progresivas y deja de
+# pedir ese buffer. Es la diferencia entre los canales que llevan semanas
+# estables (llevan bwdif) y los que caen cada pocos minutos (no lo llevan).
+# El sistema lo detecta solo y se corrige en el siguiente arranque.
+_VAAPI_ACCESS_UNIT_ERRORS = (
+    "access unit too large",
+    "pic->prev failed",
+    "vaapi_encode.c",
+)
+
+_VAAPI_DEINTERLACE_FILTER = "bwdif=mode=send_frame:parity=tff"
 
 # Pipeline de 2 etapas: la GPU NVIDIA (NVDEC + scale_cuda) decodifica y escala,
 # y la iGPU (VAAPI) solo codifica. Los frames viajan por un pipe NUT.
@@ -393,6 +419,9 @@ class StreamInstance:
     def __init__(self, name, config):
         self.name = name
         self.config = config
+        # Deinterlace forzado por fallo del encoder VAAPI (ver
+        # _VAAPI_ACCESS_UNIT_ERRORS). Si esta activo, el -vf lleva bwdif.
+        self._force_deinterlace = False
         self.process = None
         self._vlc_process = None
         self._vlc_port = None
@@ -455,25 +484,32 @@ class StreamInstance:
         self._audio_source_checked_at = 0.0
 
     def register_failure(self, message=""):
-        """Registra una falla y devuelve (should_retry, fatal, backoff_seconds)."""
+        """Registra una falla y devuelve (should_retry, fatal, backoff_seconds).
+
+        El sistema de emision no puede dejar de reintentar: un canal caido
+        es un canal que no se esta emitiendo, y el origen puede volver en
+        cualquier momento. Por eso NUNCA se devuelve should_retry=False.
+
+        Lo que se controla es el ritmo: backoff creciente (5s, 15s, 30s,
+        60s, 120s y 300s como tope) para no martillear un origen caido, y un
+        ritmo mas lento todavia para los errores fatales.
+        """
         with self._lock:
             self._consecutive_failures += 1
             self._last_failure_at = time.time()
+            # Auto-remedio: si el fallo es del encoder VAAPI, se deinterlaza
+            # en el proximo arranque (si no, el canal se cae cada vez).
+            self._maybe_activate_deinterlace(message)
             fatal = _is_fatal_error(message or self.error_message)
             if fatal:
                 self._blocked_reason = "fatal_error"
-                self._next_retry_at = 0.0
-                return False, True, 0
-            idx = min(self._consecutive_failures - 1, len(_RETRY_BACKOFF_SECONDS) - 1)
-            backoff = _RETRY_BACKOFF_SECONDS[idx]
-            should_retry = self._consecutive_failures < _MAX_CONSECUTIVE_FAILURES
-            if not should_retry:
-                self._blocked_reason = "max_failures"
-                self._next_retry_at = 0.0
-                return False, False, backoff
-            self._blocked_reason = ""
+                backoff = _FATAL_RETRY_SECONDS
+            else:
+                idx = min(self._consecutive_failures - 1, len(_RETRY_BACKOFF_SECONDS) - 1)
+                backoff = _RETRY_BACKOFF_SECONDS[idx]
+                self._blocked_reason = ""
             self._next_retry_at = time.time() + backoff
-            return True, False, backoff
+            return True, fatal, backoff
 
     def mark_episode_started(self):
         """Marca que el proceso arranco OK: hay un episodinio en curso."""
@@ -563,12 +599,16 @@ class StreamInstance:
             self._episode_active = False
 
     def is_blocked(self):
-        with self._lock:
-            if self._blocked_reason:
-                return True, self._blocked_reason
-            if self._consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
-                return True, "max_failures"
-            return False, ""
+        """El sistema de emision no bloquea streams: siempre reintenta.
+
+        Antes este metodo devolvia True al alcanzar 4 fallos seguidos y el
+        canal se quedaba caido 10 minutos (o para siempre, si nadie lo
+        tocaba). Ahora no existe el techo de reintentos: el ritmo de los
+        reintentos lo marca _next_retry_at.
+
+        Se mantiene el metodo por compatibilidad con quien lo consulta.
+        """
+        return False, ""
 
     def get_retry_state(self):
         with self._lock:
@@ -581,13 +621,27 @@ class StreamInstance:
             }
 
     def maybe_reset_on_stable(self):
-        """Si el stream lleva > _STABLE_RUNNING_SECONDS en running, resetea el breaker."""
+        """Si el stream lleva > _STABLE_RUNNING_SECONDS vivo, resetea el breaker.
+
+        Antes exigia status == 'running'. Con el sistema de reintentos sin
+        techo, un stream que se recupera queda en 'error' (estado del
+        ultimo fallo) mientras vive: exigir 'running' hacia que el contador
+        de fallos no se limpiara nunca y el backoff se quedara en 300 s para
+        siempre aunque el canal estuviera perfecto.
+
+        Aqui el criterio es el proceso: si lleva 60 s vivo, el canal esta
+        estable y el contador vuelve a cero.
+        """
         if self._consecutive_failures == 0:
             return False
-        if self.start_time is None or self.status != "running":
+        if self.start_time is None:
+            return False
+        if not self.is_running():
             return False
         if time.time() - self.start_time >= _STABLE_RUNNING_SECONDS:
             self.reset_failures()
+            with self._status_lock:
+                self._status = "running"
             return True
         return False
 
@@ -623,9 +677,59 @@ class StreamInstance:
             cmd.extend(shlex.split(pre_opts))
         cmd.extend(["-i", original_url])
         if post_opts:
-            cmd.extend(shlex.split(post_opts))
+            cmd.extend(self._post_option_tokens(post_opts))
         cmd.append(destination_url)
         return cmd
+
+    def _post_option_tokens(self, post_opts):
+        """Tokens del POST_OPTIONS, con el deinterlace forzado si toca."""
+        tokens = shlex.split(post_opts)
+        if not self._force_deinterlace:
+            return tokens
+        out, i = [], 0
+        while i < len(tokens):
+            if tokens[i] == "-vf" and i + 1 < len(tokens):
+                vf = tokens[i + 1]
+                if "bwdif" not in vf:
+                    vf = f"{_VAAPI_DEINTERLACE_FILTER},{vf}"
+                out.extend(["-vf", vf])
+                i += 2
+                continue
+            out.append(tokens[i])
+            i += 1
+        return out
+
+    def _maybe_activate_deinterlace(self, message=""):
+        """Activa el deinterlace si el fallo es del encoder VAAPI de Intel.
+
+        El driver aborta el encoder con 'Access unit too large' cuando no
+        consigue reservar la superficie del extra header. Deinterlazando, el
+        encoder recibe frames progresivas y no pide ese buffer: el canal se
+        queda arriba. Es un auto-remedio: se detecta solo y se aplica en el
+        siguiente arranque, sin tocar el INI.
+        """
+        if self._force_deinterlace:
+            return False
+        # Se mira el mensaje recibido, el ultimo error del stream y las
+        # ultimas lineas del log: el sintoma del driver puede no ser la
+        # ultima linea con "error" (el assertion suele venir detras de
+        # "Access unit too large").
+        candidates = [message or "", self.error_message or ""]
+        try:
+            with self._logs_lock:
+                candidates.extend(list(self.last_lines)[-25:])
+        except Exception:
+            pass
+        low = " ".join(candidates).lower()
+        if not any(p in low for p in _VAAPI_ACCESS_UNIT_ERRORS):
+            return False
+        self._force_deinterlace = True
+        logger.warning(
+            "Stream '%s': fallo del encoder VAAPI (%s). Se activa el "
+            "deinterlace automatico en el proximo arranque.",
+            self.name, (message or self.error_message)[:90],
+        )
+        return True
 
     # ---------- pipeline NVIDIA (decodificar/escalar en la NVIDIA) ----------
 
@@ -690,7 +794,7 @@ class StreamInstance:
             clean_pre.append(pre_tokens[i])
             i += 1
 
-        filters, rest_post = self._split_vf(shlex.split(post_opts))
+        filters, rest_post = self._split_vf(self._post_option_tokens(post_opts))
         size = self._target_size(filters)
 
         # Los filtros de software (bwdif) van a la NVIDIA con su equivalente
@@ -1096,6 +1200,13 @@ class StreamInstance:
         self._stop_vlc()
         self._status = "stopped"
         self.start_time = None
+        # Las metricas se limpian al parar: si no, el panel muestra un canal
+        # "Detenido" con el bitrate de la ultima ejecucion (parece que esta
+        # emitiendo cuando en realidad no hay trafico).
+        self.bitrate = ""
+        self.audio_bitrate = ""
+        self.file_size = ""
+        self.speed = ""
         logger.info(f"Stream '{self.name}' detenido")
 
     def cleanup(self):
@@ -1181,9 +1292,11 @@ class StreamInstance:
             "vlc_port": cfg.get("vlc_port"),
             "autostart": bool(cfg.get("autostart", False)),
             "last_lines": last_lines_snapshot,
+            "force_deinterlace": self._force_deinterlace,
             "circuit_breaker": {
                 "consecutive_failures": retry_state["consecutive_failures"],
                 "next_retry_at": retry_state["next_retry_at"],
+                "next_retry_in": max(0, int(retry_state["next_retry_at"] - time.time())),
                 "blocked": blocked,
                 "blocked_reason": blocked_reason,
             },
@@ -1569,9 +1682,13 @@ class StreamManager:
                     )
                     return False
 
-                # Respetar ventana de backoff (_next_retry_at)
+                # Respetar ventana de backoff (_next_retry_at).
+                # Excepcion: el reinicio por falta de audio tiene su propio
+                # ritmo (MAX_AUDIO_RESTARTS_PER_HOUR) y es un fallo distinto
+                # del que motivo el backoff: un canal mudo se corrige
+                # reiniciando el ffmpeg, aunque el ultimo fallo sea reciente.
                 retry_state = stream.get_retry_state()
-                if retry_state["next_retry_at"] > time.time():
+                if reason != "no_audio" and retry_state["next_retry_at"] > time.time():
                     wait = retry_state["next_retry_at"] - time.time()
                     logger.debug(
                         "Stream '%s' en backoff, faltan %.1fs para reintento",
@@ -1647,17 +1764,17 @@ class StreamManager:
             should_retry, fatal, backoff = stream.register_failure(fail_msg)
             if fatal:
                 logger.error(
-                    "Stream '%s' error fatal detectado (%s). Marcado 'error', "
-                    "requiere start manual.",
-                    name, fail_msg[:120],
+                    "Stream '%s' error fatal detectado (%s). Marcado 'error'; "
+                    "se reintentara cada %ds hasta que el origen vuelva.",
+                    name, fail_msg[:120], backoff,
                 )
                 with stream._status_lock:
                     stream._status = "error"
-            elif not should_retry:
+            elif stream._consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
                 logger.error(
-                    "Stream '%s' alcanzo %d fallos consecutivos. Marcado 'error', "
-                    "requiere start manual.",
-                    name, _MAX_CONSECUTIVE_FAILURES,
+                    "Stream '%s' alcanzo %d fallos consecutivos. Marcado 'error' "
+                    "(sigue reintentandose cada %ds).",
+                    name, _MAX_CONSECUTIVE_FAILURES, backoff,
                 )
                 with stream._status_lock:
                     stream._status = "error"

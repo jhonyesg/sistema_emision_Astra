@@ -201,11 +201,17 @@ Tabla con los últimos 5 reinicios automáticos: timestamp, nombre del stream, t
 
 ## Arquitectura del Sistema
 
-> **Aceleracion por GPU (NVIDIA + iGPU)**: desde el 27/10/2026 la decodificacion
-> y el escalado se hacen en la GPU NVIDIA (NVDEC + `scale_cuda`) y la iGPU solo
-> codifica, con la calidad intacta. Se activa por stream con `DECODER=nvidia`.
-> Detalle, requisitos y casos que no pueden migrarse:
-> [`docs/NVDEC_PIPELINE.md`](docs/NVDEC_PIPELINE.md).
+> **Aceleracion por GPU (iGPU)**: la codificacion y el escalado los hace la
+> iGPU (Intel UHD 630, `h264_vaapi` + `scale_vaapi` sobre `/dev/dri/renderD128`).
+> La decodificacion es por software (CPU) y las fuentes de television vienen
+> entrelazadas, asi que el video pasa por `bwdif` (deinterlace) antes de
+> codificar: sin el, el encoder VAAPI de Intel aborta con
+> `Access unit too large` y el canal se cae.
+>
+> El pipeline de 2 etapas con NVIDIA (NVDEC + `scale_cuda`) sigue en el codigo
+> para cuando haya una GPU NVIDIA disponible: se activa por stream con
+> `DECODER=nvidia`. En los hosts sin NVIDIA **no debe activarse**.
+> Detalle: [`docs/NVDEC_PIPELINE.md`](docs/NVDEC_PIPELINE.md).
 
 
 ```

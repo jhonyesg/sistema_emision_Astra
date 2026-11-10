@@ -1,6 +1,179 @@
+---
+
+## [Sin versionar] — 2026-11-10 — Se retiro la GPU NVIDIA del host: revision de toda la cadena que dependia de ella
+
+### Contexto
+El usuario retiro la GPU NVIDIA (GeForce GT 1030) del host. La tarjeta sigue en el PCI pero su driver esta roto (`nvidia-smi` -> *Unknown Error*, `h264_nvenc` -> *Conversion failed*). El host emite **solo con la iGPU** (Intel UHD 630, `/dev/dri/renderD128`).
+
+### Revision: nada quedo apuntando a la NVIDIA en el camino caliente
+| Comprobacion | Estado |
+|---|---|
+| Streams con `DECODER=nvidia` en `db/<instancia>.ini` | **0** |
+| `renderD128` (el nodo que usa el codigo) | Intel i915 `0000:00:02.0` — correcto |
+| Procesos usando la NVIDIA (`renderD129`) | **0** |
+| INIs referenciando `renderD129` | **0** |
+| Watchdog / monitor chequeando la NVIDIA | ninguno |
+| `h264_nvenc` | no funciona, pero no se usa |
+
+### El efecto real de la retirada: por que caian los canales
+Al quedarse sin NVDEC, **todos** los streams pasaron a decodificar por software. Las fuentes de television son MPEG-2 entrelazadas (`field_order=tt` en las 23 de las que se pudo sondear), asi que el decoder por software entrega frames entrelazados al encoder VAAPI de Intel, que aborta con `Access unit too large` -> ENOSPC -> `Assertion !pic->prev`. Antes, la etapa NVDEC entregaba frames ya progresivos y escalados, y el problema no existia.
+
+Por eso el fallo era **sistémico y en cascada**: no era de un canal, caia sobre el siguiente que fallaba (8 canales de golpe al reiniciar el servicio).
+
+### Cambios aplicados
+| Archivo | Cambio |
+|---|---|
+| `db/<instancia>.ini` | `bwdif=mode=send_frame:parity=tff` en el `-vf` de los **19 streams** con fuente entrelazada que no lo tenian (antes solo lo tenian 4). Preventivo: el deinterlace queda en la config y sobrevive a los reinicios, a diferencia del auto-remedio en memoria. |
+| `/etc/systemd/system/131_A.service` | El `ExecStartPre` que esperaba a `/dev/nvidiactl` ahora **solo espera si algun INI usa `DECODER=nvidia`**. Antes, si se retiraba la tarjeta del todo, el arranque se retrasaba 60 s en un bucle inútil. |
+| `README.md` | La nota de arquitectura ya no dice que la decodificacion va a la NVIDIA; explica el papel de la iGPU, el deinterlace obligatorio y que `DECODER=nvidia` no debe activarse en hosts sin NVIDIA. |
+
+### Coste medido del deinterlace
+Un stream: **6% -> 12% de un core** con `bwdif` (el filtro es software y ademas duplica los frames, que luego `-r 30000/1001` recorta). En un host de 16 nucleos con 38 streams, la carga se mantiene en ~10 de 16 (load average 9.7) y sube a ~47% de CPU.
+
+### Verificacion
+- 38/38 streams vivos tras aplicar el cambio.
+- 23 streams con `bwdif`; 22 validados con uptime > 60 s tras reiniciarlos **uno a uno** (sin la ola de caidas que provoca reiniciar el servicio entero).
+- El cambio se aplico editando el INI: el watcher recarga la config en memoria sin reiniciar, asi que no hubo cortes.
+
 # Changelog — sistema_emision_Astra
 
 Todas las modificaciones relevantes del proyecto. Sigue [Keep a Changelog](https://keepachangelog.com/es/1.1.0/) y versionado semántico ligero (pre-1.0: cualquier bump es válido).
+
+---
+
+## [Sin versionar] — 2026-11-10 — `<canal>` caido en bucle: el ghost-detector del media server mataba al publisher cada 30 s
+
+### Resumen en una línea
+El canal <canal> no levantaba: el `ghost-detector` del `panel-api` (media server) lo declaraba "ghost" y lo expulsaba de SRS a los ~31 s de publicar, provocando un ciclo de reinicio infinito (`Broken pipe` → `Conversion failed!`).
+
+### Diagnostico
+Cadena real, verificada en los logs del contenedor `mediaserver-platform`:
+
+1. El origen del canal estaba caido. La entrada usaba `https://<origen-hls>/<ruta>`, que ya no resuelve (HTTP 000). El enlace vivo, extraido de `https://<web-del-canal>.com/senal-en-vivo/` (iframe `<url-del-canal>`), es `https://<cdn-origen>/<ruta-del-canal>`.
+2. Con el origen caido, la sonda de audio del monitor (`probe_audio_packets` → `ffprobe` contra `Destination_URL`) conectaba como **rtmp-play** a una clave sin publisher. SRS creaba un *live source* fantasma (`new live source, stream_url=/live/cosmovision_bk`) con `recv=0/send=0`.
+3. Ese source fantasma dejaba al `ghost-detector` con un **candidato viejo** (timestamp de hace minutos) para `cosmovision_bk`.
+4. Al volver el origen y conectar el publisher real, el `ghost-detector` confirmaba el candidato y lo expulsaba:
+   ```
+   [ghost-detector] WARNING: GHOST CONFIRMADO stream=cosmovision_bk cid=ye40z00n id=vid-536k800 age=30s recv=0 send=0 publish_active=True threshold=30s
+   [ghost-detector] INFO: ghost_detector: stream=cosmovision_bk cid=ye40z00n age=30s publish_active=True kicked=1 disposed=False
+   ```
+   El `DELETE http://127.0.0.1:1986/api/v1/clients/<cid>` que aparece en el log de SRS es **de ese detector**, no una caida de red. El `Broken pipe` del ffmpeg es la consecuencia, no la causa.
+
+El umbral del detector (`ghost_detector_threshold_seconds = 30`) choca con la ventana rolling de 30 s de `kbps.recv_30s` de SRS: recien restaurado el origen, el contador va a 0 y el detector confirma el ghost justo antes de que la ventana se llene.
+
+### Cambio
+| Archivo | Cambio |
+|---|---|
+| `db/<instancia>.ini` (`[<canal>]`) | Origen corregido al enlace vivo del CDN (`<cdn-origen>`), ya coincidente con el sitio. |
+| `db/<instancia>.ini` (`[<canal>]`) | `FFMPEG_PRE_OPTIONS`: reconexion ante fallo del CDN al estilo de las fuentes HLS externas del proyecto (`-reconnect_delay_max 30`, `-reconnect_on_http_error 4xx,5xx`, `-reconnect_on_network_error 1`). |
+| `db/<instancia>.ini` (`[<canal>]`) | `-live_start_index -1`: arranca en el borde vivo (la ventana HLS del CDN son 6x4 s) en vez de ~16 s atras en cada reinicio. |
+
+Con `-reconnect_delay_max 30` el ffmpeg aguanta un corte de hasta 30 s del CDN **sin morir**, y por tanto sin entrar en el ciclo reinicio → sonda de audio → source fantasma → expulsion del publisher. Es la parte que se puede cerrar desde el INI.
+
+### Pendiente (fuera del INI)
+El `ghost-detector` sigue teniendo la carrera de 30 s: si el origen cae mas de 30 s (el ffmpeg ya no aguanta), la sonda vuelve a crear el source fantasma y el siguiente publisher puede ser expulsado igual. El arreglo de raiz esta en `mediaserver-platform/backend/services/ghost_detector.py`: resetear la marca del candidato cuando cambia el `cid` del publisher, o subir `ghost_detector_threshold_seconds` por encima de 30 (p. ej. 45-60) para que la ventana de `recv_30s` se llene antes de confirmar.
+
+### Verificacion
+```
+<canal>  running | 1932.6 KBITS/S | alive: True | error: (ninguno)
+SRS: publish.active=true  kbps={"recv_30s": 1957, "send_30s": 1962}  clients=2
+FLV http://127.0.0.1:8080/live/cosmovision_bk.flv -> 200, h264 720x408 + aac 48 kHz
+Tras el reinicio: sin 'candidato cosmovision_bk' ni 'GHOST CONFIRMADO' en el log del detector
+```
+
+---
+
+## [Sin versionar] — 2026-11-10 — Canales que caian cada pocos minutos: el encoder VAAPI de Intel abortaba por el "access unit too large" (auto-remedio con deinterlace)
+
+### Resumen en una línea
+Un grupo de canales (incluido **<canal>, que es vital**) se caia cada pocos minutos con `Assertion !pic->prev failed at src/libavcodec/vaapi_encode.c:964`. La causa real era un fallo del driver de Intel (`Access unit too large` → ENOSPC), y la diferencia entre los canales estables y los que caian era **una sola**: los estables deinterlazan (`bwdif`), los que caian no.
+
+### Diagnostico
+El assertion era el sintoma final; la cadena real en el stderr era:
+```
+[h264_vaapi @ ...] Access unit too large: 8192 < 14656.
+[h264_vaapi @ ...] Failed to write extra header 0: -28.      <- ENOSPC
+[h264_vaapi @ ...] Encode failed: -28.
+[vost#0:0/h264_vaapi @ ...] Error submitting video frame to the encoder
+Error while filtering: No space left on device
+Assertion !pic->prev failed at src/libavcodec/vaapi_encode.c:964
+```
+El driver no consigue reservar la superficie que el encoder necesita para el extra header. Los parametros del encoder eran **identicos** entre los que fallaban y los que no (`-bf 0`, `-g 30`, `-quality 4`, `h264_vaapi`), y las fuentes tambien (MPEG-2 720x480 entrelazado). La unica diferencia era el filtro:
+| Stream | `-vf` | Deinterlace | Resultado |
+|---|---|---|---|
+| `<canal-estable>` | `bwdif=...,scale_vaapi,...` | si | semanas estable |
+| `<canal>` | `format=nv12,hwupload,scale_vaapi,...` | no | caia cada ~11 s |
+| `<canal>` | `scale=...,format=nv12,hwupload` | no | estable (fuente ya progresiva) |
+
+Verificado de forma controlada (mismo ffmpeg, misma fuente, 4 intentos seguidos): **sin bwdif 4/4 fallos, con bwdif 3/3 correcto** (reproducido en `<canal>`, `<canal>` y `<canal>`).
+
+### Cambio: auto-remedio, sin tocar el INI de cada canal
+| Archivo | Cambio |
+|---|---|
+| `stream_manager.py` | Se detecta el fallo del encoder VAAPI (`Access unit too large`, `pic->prev failed`, `vaapi_encode.c`) en el mensaje **y** en las ultimas lineas del log del stream. |
+| `stream_manager.py` | Al detectarlo se activa el deinterlace forzado del stream y se registra en el log: el siguiente arranque ya lleva `bwdif=mode=send_frame:parity=tff` delante del `-vf`. Es idempotente (no duplica el filtro si ya estaba). |
+| `stream_manager.py` | En el pipeline NVIDIA el filtro se traduce a `bwdif_cuda` (ya estaba soportado). |
+| `stream_manager.py` | `get_info()` expone `force_deinterlace` para que el operador vea que el canal lleva el deinterlace forzado. |
+
+### Canales levantados a mano (mismo fix, aplicado por config)
+`<canal>` y `<canal>` llevan `bwdif` en su `FFMPEG_POST_OPTIONS` (copiado del canal gemelo estable `<canal-estable>`), por ser el canal vital y no querer esperar al reintento.
+
+### Verificacion
+```
+37/38 streams vivos (el que queda, <canal>, tiene el ORIGEN caido:
+                      <origen-hls> no resuelve -> reintenta solo)
+8 streams auto-reparados: <canal>, <canal>, <canal>,
+   <canal>, <canal>, <canal>, <canal>, <canal>
+<canal>: 1878 KBITS/S, uptime 177s, sin caidas
+```
+- El ultimo `pic->prev` fue a las 16:50:02 (mientras se aplicaba el remedio); **ninguno en los minutos siguientes**.
+- Reinicios por stream desde el arranque: 1-2 (antes: indefinidos).
+- 0 procesos huerfanos, 0 fifos obsoletos en `/tmp/astra_nv`.
+
+### Pendiente
+`<canal>` sigue caido por su origen (`<origen-hls>` no acepta conexiones). El sistema reintenta solo cada 5 min; en cuanto el origen vuelva, el canal levanta sin intervencion.
+
+---
+
+## [Sin versionar] — 2026-11-10 — Canales que no se reintentaban: el breaker hacia de reintentar y un throttle global tapaba la recuperacion
+
+### Resumen en una línea
+`<canal>` y `<canal-relay>` quedaron en `error` y **no se reintentaron en 2 horas** (solo un humano los resucitaba), mientras el sistema si lo hacia con otros canales: habia un **techo de reintentos** de 4 fallos y un **throttle global de 3 s** que un stream ruidoso renovaba cada ciclo, tapando la recuperacion de los que venian despues en el orden.
+
+### Sintoma reportado
+Panel con `<canal>` y `<canal-relay>` en error, sin ningun reintento visible. En el log:
+```
+14:29:29 ERROR stream_manager: Stream '<canal>' alcanzo 4 fallos consecutivos. Marcado 'error', requiere start manual.
+(nada hasta las 16:22, cuando un operador hizo POST /api/stream/<canal>/start)
+```
+
+### Causa raiz (dos bugs encadenados)
+1. **Techo de reintentos** (`stream_manager.py`): `register_failure()` devolvia `should_retry=False` al cuarto fallo consecutive y marcaba `blocked_reason='max_failures'`. El canal solo se reintentaba cada `RECOVERY_INTERVAL` (600 s) y, si no, se quedaba muerto hasta que un humano lo tocara. Contradictorio: es un sistema de emision, un canal caido es un canal que no se emite.
+2. **Throttle global que tapaba la recuperacion** (`monitor.py`): `_may_restart()` renovaba la ventana global de 3 s **incluso cuando iba a rechazar** el reinicio (por tope/hora). `<canal>`, caido y en pausa, la renovaba en cada ciclo de 10 s → cualquier stream posterior en el orden del INI nunca pasaba el filtro. Por eso `<canal>` (posicion 14, antes que el ruidoso) si se recuperaba a los 616 s, y `<canal>` (35) y `<canal-relay>` (36), despues, no.
+
+### Cambios aplicados
+| Archivo | Cambio |
+|---|---|
+| `stream_manager.py` | `register_failure()` **nunca** devuelve `should_retry=False`: el ritmo lo marca un backoff creciente (5, 15, 30, 60, 120 y 300 s como tope). Los errores fatales (404, protocolo inexistente) tambien se reintentan, a 300 s, avisando al operador. |
+| `stream_manager.py` | `is_blocked()` ya no bloquea: no existe el techo de reintentos. El ritmo lo impone `_next_retry_at`. |
+| `stream_manager.py` | `maybe_reset_on_stable()` resetea por **proceso vivo** (60 s), no por `status == 'running'`: si no, un canal recuperado se quedaba con el contador de fallos alto y el backoff topado en 300 s para siempre. |
+| `stream_manager.py` | `stop()` limpia las metricas: el panel mostraba canales "Detenido" con el bitrate de la ultima ejecucion (652 kbits en un canal sin trafico). |
+| `monitor.py` | `_may_restart()`: el tope por hora (12/stream, 10 min de pausa) ya no consume el turno de los demas; el anti-tormenta se resuelve con un **presupuesto por ciclo** (`RECOVERIES_PER_CYCLE = 6`) en vez de un throttle global. |
+| `monitor.py` | `_try_recover_blocked()` reintenta segun el backoff del propio stream, sin resetear el contador (si se resetea, el backoff vuelve a empezar por 5 s y el canal entra en bucle corto). |
+| `monitor.py` | Prioridad en el ciclo: primero los canales caidos y mas antiguos. Se evita el log "proceso murio" cada 10 s mientras se espera el backoff. |
+| `stream_manager.py` | El reinicio por falta de audio (motivo `no_audio`) queda exento del backoff: tiene su propio ritmo (`MAX_AUDIO_RESTARTS_PER_HOUR`) y es un fallo distinto. |
+
+### Verificacion
+```
+<canal>:      alive=True  bitrate=683.5 KBITS/S  fallos=0
+<canal-relay>: alive=True  bitrate=1934.8 KBITS/S fallos=0
+```
+- Los dos canales que estaban muertos hace 2 horas se recuperan **solos**.
+- Cadencia de reintentos observada: `fallo #2 -> 15s`, `#3 -> 30s`, `#4 -> 60s`, `#5 -> 120s`, tope 300 s.
+- 35/38 streams vivos; los 3 restantes estan en ciclo de reintento automatico (no parados).
+
+### Hallazgo abierto (NO resuelto aqui)
+`Assertion !pic->prev failed at src/libavcodec/vaapi_encode.c:964` — **5436 ocurrencias historicas**, preexistente y cronico. Afecta a ~12 streams (`<canal>` 944, `<canal>` 613, `<canal>` 395...). Es la asercion `av_assert0(pic->prev || pic->type == PICTURE_TYPE_IDR)` del encoder VAAPI de Intel: el encoder recibe un frame que no es IDR sin referencia previa valida. Los parametros del encoder son identicos entre los que fallan y los que no (`-bf 0`, `-g 30`, `-quality 4`, `h264_vaapi`), asi que la causa esta en la fuente. Pendiente de analizar canal por canal.
 
 ---
 
@@ -11,12 +184,12 @@ El panel mostraba `0 activas / 0 total`, `— cargando...` en el selector de INI
 
 ### Diagnóstico (lo que de verdad pasó)
 ```
-2026-11-06 12:05:24 INFO werkzeug: 192.168.0.137 - - [...] "GET /api/configs HTTP/1.1" 401 -
-2026-11-06 12:05:26 INFO werkzeug: 192.168.0.137 - - [...] "GET /api/status HTTP/1.1" 401 -
-2026-11-06 12:05:32 INFO werkzeug: 192.168.0.137 - - [...] "GET / HTTP/1.1" 200 -
+2026-11-06 12:05:24 INFO werkzeug: 192.168.0.<lan> - - [...] "GET /api/configs HTTP/1.1" 401 -
+2026-11-06 12:05:26 INFO werkzeug: 192.168.0.<lan> - - [...] "GET /api/status HTTP/1.1" 401 -
+2026-11-06 12:05:32 INFO werkzeug: 192.168.0.<lan> - - [...] "GET / HTTP/1.1" 200 -
 ```
 - El HTML se servía bien (200) y todas las APIs fallaban (401) → la página loadea pero no puede leer nada.
-- `api_trusted_ips` en `config.json` era `["127.0.0.1", "::1", "192.168.0.117"]`. Tras el reinicio del equipo el navegador del operador pasó a `192.168.0.137` → fuera de la lista → 401.
+- `api_trusted_ips` en `config.json` era `["127.0.0.1", "::1", "192.168.0.<lan>"]`. Tras el reinicio del equipo el navegador del operador pasó a `192.168.0.<lan>` → fuera de la lista → 401.
 - **El INI sí se había cargado bien**: `resolve_active_ini_path()` da prioridad a `ASTRA_INI` (= `db/1_default.ini` en el unit) y el ffmpeg estaba publicando a `live/<stream>` con la config correcta. El servicio llevaba 1 h 25 min `active (running)` con el stream en marcha.
 - `active_config` en `config.json` apuntaba a `db/138_a.ini` (config de otro despliegue). No afectaba por el override del entorno, pero si faltara `ASTRA_INI` se cargaría el INI equivocado → corregido.
 
@@ -25,13 +198,13 @@ El panel mostraba `0 activas / 0 total`, `— cargando...` en el selector de INI
 |---|---|
 | `api_auth.py` | `ApiAuth` acepta un `config_loader`: la lista de IPs de confianza se **relee del disco** (TTL 5 s). Antes solo se leía al arrancar, así que corregirla exigía reiniciar el servicio. |
 | `app.py` | `ApiAuth(app_config, BASE_DIR, config_loader=load_app_config)`. |
-| `config.json`, `config.<instancia>.json` (fuera de git) | `api_trusted_ips` → `["127.0.0.1", "::1", "192.168.0.0/24"]` (el default del propio código: lecturas abiertas a la LAN, **escrituras siempre con token**). `active_config` → `db/1_default.ini`. |
+| `config.json`, `config.<instancia>.json` (fuera de git) | `api_trusted_ips` → `["127.0.0.1", "::1", "192.168.0.<lan>/24"]` (el default del propio código: lecturas abiertas a la LAN, **escrituras siempre con token**). `active_config` → `db/1_default.ini`. |
 | `tests/test_api_auth.py` (nuevo) | 8 pruebas: IP de confianza, rango CIDR, default sin lista, relectura desde disco, cargador roto, escrituras exigen token, lectura sin token, token válido. |
 
 ### Verificación
 ```
-192.168.0.137  /api/status -> 200   /api/configs -> 200     (era 401)
-192.168.0.117  /api/status -> 200
+192.168.0.<lan>  /api/status -> 200   /api/configs -> 200     (era 401)
+192.168.0.<lan>  /api/status -> 200
 10.9.9.9       /api/status -> 401                           (sigue protegido)
 ```
 - 13/13 tests OK (5 de audio + 8 de auth).
