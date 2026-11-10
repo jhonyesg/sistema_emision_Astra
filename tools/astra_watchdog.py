@@ -13,6 +13,7 @@ Solo escribe en el log cuando detecta problemas.
 
 Uso: astra_watchdog.py [--verbose]
 """
+import glob
 import json
 import os
 import subprocess
@@ -23,17 +24,31 @@ import urllib.parse
 import urllib.request
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# (etiqueta, base URL, fichero de token)
-INSTANCES = [
-    ("112_A", "http://127.0.0.1:5006", ".api_token.112_a"),
-    ("112_B", "http://127.0.0.1:5007", ".api_token.112_b"),
-]
 SRS_API = "http://127.0.0.1:1986/api/v1/summaries"
 LOG_FILE = "/var/log/astra-watchdog.log"
-DISCO = "sdc"          # disco de grabaciones (10 TB)
+DISCO = "sdc"          # disco de grabaciones
 MAX_DISK_AWAIT_MS = 40
 MAX_SRS_CPU = 85
 MAX_HOST_LOAD = 20
+
+
+def discover_instances():
+    """Descubre las instancias locales por sus ficheros de token.
+
+    Cada instancia tiene un `.api_token.<instancia>` en la raiz del proyecto.
+    Se listan en vez de fijarlos en el codigo: asi el watchdog funciona en
+    cualquier nodo sin tocarlo.
+    """
+    instances = []
+    for path in sorted(glob.glob(os.path.join(BASE_DIR, ".api_token.*"))):
+        label = os.path.basename(path).lstrip(".").split(".", 1)[1]
+        # El puerto se deduce del sufijo de la instancia (_a -> 5006, _b -> 5007).
+        port = 5007 if label.endswith("_b") else 5006
+        instances.append((label, f"http://127.0.0.1:{port}", path))
+    return instances
+
+
+INSTANCES = discover_instances()
 
 VERBOSE = "--verbose" in sys.argv
 
@@ -67,7 +82,7 @@ def log(msg, always=False):
 
 def api_token(token_file):
     """Token de API de una instancia (fichero .api_token.<instancia>, 0600)."""
-    path = os.path.join(BASE_DIR, token_file)
+    path = token_file if os.path.isabs(token_file) else os.path.join(BASE_DIR, token_file)
     try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read().strip()

@@ -59,3 +59,9 @@ grabacion_test*.flv
 # OS
 .DS_Store
 Thumbs.db
+
+# Estado local de herramientas (registry de skills)
+.atl/
+
+# Conflictos de sincronizacion (syncthing): nunca son codigo
+*.sync-conflict-*
